@@ -1,0 +1,7 @@
+_target_: robo_dataset.transforms.disk_cached.ResizeImages
+image_keys:
+  - agentview_image
+  - robot0_eye_in_hand_image
+target_h: 84
+target_w: 84
+version: "1"

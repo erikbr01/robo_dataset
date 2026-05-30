@@ -1,0 +1,7 @@
+_target_: robo_dataset.backends.hdf5.RobomimicHDF5Store
+path: ???
+obs_keys:
+  - agentview_image
+  - robot0_eye_in_hand_image
+abs_action: false
+rotation_rep: axis_angle

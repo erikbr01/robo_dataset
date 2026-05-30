@@ -9,7 +9,7 @@ Rules:
 import numpy as np
 import pytest
 
-from tests.conftest import N_EPISODES, EP_LENGTHS, OBS_KEYS, LOWDIM_KEY, H, W, C, ACTION_DIM
+from .constants import N_EPISODES, EP_LENGTHS, OBS_KEYS, LOWDIM_KEY, H, W, C, ACTION_DIM
 
 
 def _psnr(a: np.ndarray, b: np.ndarray) -> float:

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.conftest import OBS_KEYS, LOWDIM_KEY, H, W, C, ACTION_DIM, N_EPISODES
+from .constants import OBS_KEYS, LOWDIM_KEY, H, W, C, ACTION_DIM, N_EPISODES
 
 
 # ── Tier 1: DiskCachedTransform ───────────────────────────────────────────────

@@ -1,3 +1,10 @@
+"""robo_dataset: unified trajectory dataset for robot learning.
+
+Backends (zarr, HDF5, RLDS) and conversion utilities are importable directly.
+Torch-dependent modules (TrajectoryDataset, transforms) are NOT eagerly imported
+here to avoid crashes in environments where torch is unavailable or broken.
+"""
+
 from .backends import (
     TrajectoryStore,
     WritableTrajectoryStore,
@@ -7,7 +14,6 @@ from .backends import (
     RLDSFrameStore,
     RLDSFrameStoreWriter,
 )
-from .dataset import TrajectoryDataset
 from .sampler import SequenceSampler, get_val_mask
 from .convert import convert, convert_rlds
 
@@ -19,9 +25,16 @@ __all__ = [
     "ZarrStoreWriter",
     "RLDSFrameStore",
     "RLDSFrameStoreWriter",
-    "TrajectoryDataset",
     "SequenceSampler",
     "get_val_mask",
     "convert",
     "convert_rlds",
+    "TrajectoryDataset",
 ]
+
+
+def __getattr__(name):
+    if name == "TrajectoryDataset":
+        from .dataset import TrajectoryDataset
+        return TrajectoryDataset
+    raise AttributeError(f"module 'robo_dataset' has no attribute {name!r}")

@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "robo_dataset"
@@ -26,6 +26,15 @@ dependencies = [
 video = ["torchcodec"]
 dev = ["pytest", "pytest-xdist"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["robo_dataset*"]
+[tool.hatch.build.targets.wheel]
+packages = ["robo_dataset"]
+
+[tool.uv]
+# Store uv cache on ssdB to avoid filling root filesystem
+cache-dir = "/mnt/ssdB/erik/uv_cache"
+
+[tool.uv.sources]
+# Pin torch to avoid re-downloading if already in the conda env
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

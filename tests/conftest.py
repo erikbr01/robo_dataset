@@ -1,25 +1,10 @@
-"""Test fixtures: create small synthetic HDF5 and convert to other backends.
-
-All tests use the synthetic fixture so they run without the real Robomimic dataset.
-To run against real data, override HDF5_PATH env var.
-"""
-
-import os
-import tempfile
+"""Test fixtures: create small synthetic HDF5 and convert to other backends."""
 
 import h5py
 import numpy as np
 import pytest
 
-# ── Synthetic dataset parameters ──────────────────────────────────────────────
-
-N_EPISODES = 5
-EP_LENGTHS = [10, 8, 12, 7, 15]  # variable-length episodes
-H, W, C = 32, 32, 3
-ACTION_DIM = 7
-OBS_KEYS = ["agentview_image", "robot0_eye_in_hand_image"]
-LOWDIM_KEY = "robot0_eef_pos"
-LOWDIM_DIM = 3
+from .constants import N_EPISODES, EP_LENGTHS, H, W, C, ACTION_DIM, OBS_KEYS, LOWDIM_KEY, LOWDIM_DIM
 
 
 @pytest.fixture(scope="session")
@@ -28,15 +13,23 @@ def synthetic_hdf5(tmp_path_factory):
     path = str(tmp_path_factory.mktemp("data") / "test.hdf5")
     rng = np.random.default_rng(42)
 
+    # Pre-build a smooth base image (gradient + blobs) that JPEGs well (PSNR > 30 dB)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32) / max(H, W)
+    base_gray = (128 + 60 * np.sin(4 * np.pi * yy) * np.cos(4 * np.pi * xx)).astype(np.uint8)
+    base_img = np.stack([base_gray] * C, axis=-1)  # (H, W, C)
+
     with h5py.File(path, "w") as f:
         data = f.create_group("data")
         for i, T in enumerate(EP_LENGTHS):
             demo = data.create_group(f"demo_{i}")
             obs = demo.create_group("obs")
             for key in OBS_KEYS:
-                obs.create_dataset(key, data=rng.integers(0, 255, (T, H, W, C), dtype=np.uint8))
-            obs.create_dataset(LOWDIM_KEY, data=rng.random((T, LOWDIM_DIM), dtype=np.float32))
-            demo.create_dataset("actions", data=rng.random((T, ACTION_DIM), dtype=np.float32))
+                # Smooth images: base + small per-frame perturbation (JPEG-friendly)
+                perturbations = rng.integers(-10, 10, (T, H, W, C), dtype=np.int16)
+                imgs = np.clip(base_img[None].astype(np.int16) + perturbations, 0, 255).astype(np.uint8)
+                obs.create_dataset(key, data=imgs)
+            obs.create_dataset(LOWDIM_KEY, data=rng.random((T, LOWDIM_DIM)).astype(np.float32))
+            demo.create_dataset("actions", data=rng.random((T, ACTION_DIM)).astype(np.float32))
     return path
 
 

@@ -81,13 +81,7 @@ def convert_rlds(
         ep_filtered = {k: ep_data[k] for k in keys}
         if transform is not None:
             ep_filtered = transform(ep_filtered)
-        T = ep_filtered[keys[0]].shape[0]
-        for t in range(T):
-            writer.write_frame({k: ep_filtered[k][t] for k in keys})
-        writer.end_episode()
+        writer.put_episode(ep_filtered)
 
-    writer.finalize(
-        key_shapes={k: source.frame_shape(k) for k in keys},
-        key_dtypes={k: source.frame_dtype(k) for k in keys},
-    )
+    writer.finalize()
     return RLDSFrameStore(target_path)

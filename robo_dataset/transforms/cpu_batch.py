@@ -1,8 +1,20 @@
 """CPU batch transforms — applied in DataLoader collate_fn.
 
-Input/output: Dict[str, Tensor] with shapes:
+Tensors arrive from the DataLoader with shape (B, T, *frame_shape):
   image keys:    (B, T, H, W, C)  uint8
   lowdim/action: (B, T, D)        float32
+
+The typical stack for diffusion-policy-style training is:
+
+    ComposeCPU([
+        SplitObsAction(n_obs_steps=2, obs_keys=[...], action_key="action"),
+        ImageToTensor(image_keys=[...]),
+    ])
+
+which produces:
+  image keys:    (B, n_obs_steps, C, H, W)  float32 in [0, 1]
+  lowdim keys:   (B, n_obs_steps, D)        float32
+  action:        (B, T, action_dim)         float32   ← full horizon kept
 """
 
 from typing import Dict, List, Optional
@@ -12,55 +24,74 @@ import torch
 from .base import CPUBatchTransform
 
 
-class ActionChunk(CPUBatchTransform):
+class SplitObsAction(CPUBatchTransform):
     """
-    Selects n_obs_steps observation frames and the full action horizon.
+    Slice the observation window and separate it from the action sequence.
 
-    Converts images from (B, T, H, W, C) uint8 → (B, T, C, H, W) float32 / 255.
+    Observation keys (obs_keys) are trimmed to the first n_obs_steps timesteps.
+    The action key is kept at full horizon length T.
 
-    Args:
-        n_obs_steps:  How many obs timesteps to keep (from the start of the window).
-        image_keys:   Keys to normalize to [0, 1] and permute to (C, H, W).
-        action_key:   Key for the action sequence (kept as-is).
+    Input shape:  (B, T, ...)  for all keys
+    Output shape: obs keys → (B, n_obs_steps, ...) | action → (B, T, ...)
+
+    Example for horizon=16, n_obs_steps=2:
+      obs   : (B, 16, H, W, C) → (B, 2, H, W, C)
+      action: (B, 16, D)       stays (B, 16, D)
     """
 
     def __init__(
         self,
         n_obs_steps: int,
-        image_keys: List[str] = (),
+        obs_keys: List[str],
         action_key: str = "action",
     ):
         self.n_obs_steps = n_obs_steps
-        self.image_keys = set(image_keys)
+        self.obs_keys = set(obs_keys)
         self.action_key = action_key
 
     def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         out = {}
         for key, val in batch.items():
-            if key in self.image_keys:
-                # (B, T, H, W, C) uint8 → (B, n_obs, C, H, W) float32
-                obs = val[:, : self.n_obs_steps]  # (B, n_obs, H, W, C)
-                obs = obs.permute(0, 1, 4, 2, 3).float().div(255.0)
-                out[key] = obs
-            elif key == self.action_key:
-                out[key] = val.float()
+            if key in self.obs_keys:
+                out[key] = val[:, : self.n_obs_steps]
             else:
-                # Generic lowdim: keep first n_obs_steps
-                out[key] = val[:, : self.n_obs_steps].float()
+                out[key] = val
+        return out
+
+
+class ImageToTensor(CPUBatchTransform):
+    """
+    Convert image tensors from (B, T, H, W, C) uint8  →  (B, T, C, H, W) float32 in [0, 1].
+
+    This is a format conversion (HWC→CHW, uint8→float), not statistical normalisation.
+    Statistical normalisation (mean/std) belongs in the model.
+    """
+
+    def __init__(self, image_keys: List[str]):
+        self.image_keys = set(image_keys)
+
+    def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(batch)
+        for key in self.image_keys:
+            if key not in batch:
+                continue
+            # (B, T, H, W, C) uint8  →  (B, T, C, H, W) float32
+            out[key] = batch[key].permute(0, 1, 4, 2, 3).float().div(255.0)
         return out
 
 
 class NormalizeRange(CPUBatchTransform):
     """
-    Normalize selected keys from [in_min, in_max] → [out_min, out_max].
-    Useful for lowdim observations and actions.
+    Affine rescale: [in_min, in_max] → [out_min, out_max] per selected key.
+
+    in_min / in_max may be scalars or arrays broadcastable to the key's shape.
     """
 
     def __init__(
         self,
         keys: List[str],
-        in_min: float,
-        in_max: float,
+        in_min,
+        in_max,
         out_min: float = -1.0,
         out_max: float = 1.0,
     ):
@@ -92,10 +123,7 @@ class ComposeCPU(CPUBatchTransform):
 
 
 def make_collate_fn(transform: Optional[CPUBatchTransform] = None):
-    """
-    Return a DataLoader collate_fn that stacks samples and optionally applies transform.
-    """
-    import torch.utils.data
+    """Return a DataLoader collate_fn that stacks samples and applies transform."""
 
     def collate_fn(samples):
         batch = {key: torch.stack([s[key] for s in samples]) for key in samples[0]}

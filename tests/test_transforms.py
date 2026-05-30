@@ -6,6 +6,9 @@ import torch
 
 from .constants import OBS_KEYS, LOWDIM_KEY, H, W, C, ACTION_DIM, N_EPISODES
 
+# All obs keys (images + lowdim) — both should be sliced by SplitObsAction
+ALL_OBS_KEYS = OBS_KEYS + [LOWDIM_KEY]
+
 
 # ── Tier 1: DiskCachedTransform ───────────────────────────────────────────────
 
@@ -27,10 +30,8 @@ class TestDiskCachedTransform:
 
         store = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
         transform = ResizeImages(image_keys=OBS_KEYS, target_h=16, target_w=16)
-        # First call builds cache
         apply_disk_cached(store, transform, cache_root=str(tmp_path), image_keys=OBS_KEYS)
         import os
-        # Second call should not touch the source store (just opens meta.json)
         cache_path = os.path.join(str(tmp_path), transform.cache_key())
         mtime_before = os.path.getmtime(os.path.join(cache_path, "meta.json"))
         apply_disk_cached(store, transform, cache_root=str(tmp_path), image_keys=OBS_KEYS)
@@ -62,30 +63,79 @@ def _make_batch(B=4, T=8):
     return batch
 
 
-class TestCPUBatchTransform:
-    def test_action_chunk_shapes(self):
-        from robo_dataset.transforms.cpu_batch import ActionChunk
-        t = ActionChunk(n_obs_steps=2, image_keys=OBS_KEYS, action_key="action")
+class TestSplitObsAction:
+    def test_obs_sliced_action_kept(self):
+        from robo_dataset.transforms.cpu_batch import SplitObsAction
+        t = SplitObsAction(n_obs_steps=2, obs_keys=ALL_OBS_KEYS, action_key="action")
         batch = _make_batch()
         out = t(batch)
-        # Images: (B, n_obs, C, H, W) float32
-        assert out[OBS_KEYS[0]].shape == (4, 2, C, H, W)
-        assert out[OBS_KEYS[0]].dtype == torch.float32
-        # Action: (B, T, action_dim) — untouched horizon
+        # All obs keys trimmed to n_obs_steps, shape unchanged (still HWC uint8)
+        assert out[OBS_KEYS[0]].shape == (4, 2, H, W, C)
+        assert out[OBS_KEYS[0]].dtype == torch.uint8
+        assert out[LOWDIM_KEY].shape == (4, 2, 3)
+        # Action kept at full horizon
         assert out["action"].shape == (4, 8, ACTION_DIM)
 
-    def test_image_normalization(self):
-        from robo_dataset.transforms.cpu_batch import ActionChunk
-        t = ActionChunk(n_obs_steps=2, image_keys=OBS_KEYS, action_key="action")
+    def test_non_obs_keys_pass_through(self):
+        from robo_dataset.transforms.cpu_batch import SplitObsAction
+        t = SplitObsAction(n_obs_steps=2, obs_keys=OBS_KEYS, action_key="action")
         batch = _make_batch()
         out = t(batch)
+        # LOWDIM_KEY not in obs_keys → passes through at full length
+        assert out[LOWDIM_KEY].shape == (4, 8, 3)
+
+
+class TestImageToTensor:
+    def test_hwc_to_chw_float(self):
+        from robo_dataset.transforms.cpu_batch import ImageToTensor
+        t = ImageToTensor(image_keys=OBS_KEYS)
+        batch = _make_batch()
+        out = t(batch)
+        # (B, T, H, W, C) uint8 → (B, T, C, H, W) float32 in [0, 1]
+        assert out[OBS_KEYS[0]].shape == (4, 8, C, H, W)
+        assert out[OBS_KEYS[0]].dtype == torch.float32
         assert out[OBS_KEYS[0]].min() >= 0.0
         assert out[OBS_KEYS[0]].max() <= 1.0 + 1e-6
 
-    def test_compose(self):
-        from robo_dataset.transforms.cpu_batch import ActionChunk, NormalizeRange, ComposeCPU
+    def test_non_image_keys_unchanged(self):
+        from robo_dataset.transforms.cpu_batch import ImageToTensor
+        t = ImageToTensor(image_keys=OBS_KEYS)
+        batch = _make_batch()
+        out = t(batch)
+        # lowdim and action not in image_keys — pass through untouched
+        assert out[LOWDIM_KEY] is batch[LOWDIM_KEY]
+        assert out["action"] is batch["action"]
+
+    def test_missing_key_skipped(self):
+        from robo_dataset.transforms.cpu_batch import ImageToTensor
+        t = ImageToTensor(image_keys=["nonexistent_key"] + OBS_KEYS)
+        batch = _make_batch()
+        out = t(batch)  # should not raise
+        assert out[OBS_KEYS[0]].dtype == torch.float32
+
+
+class TestComposeCPU:
+    def test_compose_split_then_to_tensor(self):
+        from robo_dataset.transforms.cpu_batch import SplitObsAction, ImageToTensor, ComposeCPU
         composed = ComposeCPU([
-            ActionChunk(n_obs_steps=2, image_keys=OBS_KEYS, action_key="action"),
+            SplitObsAction(n_obs_steps=2, obs_keys=ALL_OBS_KEYS, action_key="action"),
+            ImageToTensor(image_keys=OBS_KEYS),
+        ])
+        batch = _make_batch()
+        out = composed(batch)
+        # Images: (B, n_obs, C, H, W) float32
+        assert out[OBS_KEYS[0]].shape == (4, 2, C, H, W)
+        assert out[OBS_KEYS[0]].dtype == torch.float32
+        # Lowdim: (B, n_obs, D) float32
+        assert out[LOWDIM_KEY].shape == (4, 2, 3)
+        # Action: (B, T, action_dim) — full horizon
+        assert out["action"].shape == (4, 8, ACTION_DIM)
+
+    def test_compose_with_normalize_range(self):
+        from robo_dataset.transforms.cpu_batch import SplitObsAction, ImageToTensor, NormalizeRange, ComposeCPU
+        composed = ComposeCPU([
+            SplitObsAction(n_obs_steps=2, obs_keys=ALL_OBS_KEYS, action_key="action"),
+            ImageToTensor(image_keys=OBS_KEYS),
             NormalizeRange(keys=["action"], in_min=-1, in_max=1, out_min=-1, out_max=1),
         ])
         batch = _make_batch()
@@ -95,37 +145,35 @@ class TestCPUBatchTransform:
 
 # ── Tier 3: GPUBatchTransform ─────────────────────────────────────────────────
 
+def _cpu_processed_batch(B=4, T=8, n_obs=4):
+    from robo_dataset.transforms.cpu_batch import SplitObsAction, ImageToTensor, ComposeCPU
+    batch = _make_batch(B=B, T=T)
+    cpu = ComposeCPU([
+        SplitObsAction(n_obs_steps=n_obs, obs_keys=ALL_OBS_KEYS, action_key="action"),
+        ImageToTensor(image_keys=OBS_KEYS),
+    ])
+    return cpu(batch)
+
+
 class TestGPUBatchTransform:
     def test_random_crop_shape(self):
-        from robo_dataset.transforms.cpu_batch import ActionChunk
         from robo_dataset.transforms.gpu_batch import RandomCrop
-        batch = _make_batch()
-        # Apply CPU transform first to get (B, T, C, H, W) float
-        cpu = ActionChunk(n_obs_steps=4, image_keys=OBS_KEYS)
-        batch = cpu(batch)
-
+        batch = _cpu_processed_batch(n_obs=4)
         crop = RandomCrop(image_keys=OBS_KEYS, size=(24, 24), pad=4)
         out = crop(batch)
         assert out[OBS_KEYS[0]].shape == (4, 4, C, 24, 24)
 
     def test_random_crop_different_per_sample(self):
-        from robo_dataset.transforms.cpu_batch import ActionChunk
         from robo_dataset.transforms.gpu_batch import RandomCrop
-        batch = _make_batch(B=8)
-        cpu = ActionChunk(n_obs_steps=4, image_keys=OBS_KEYS)
-        batch = cpu(batch)
+        batch = _cpu_processed_batch(B=8, n_obs=4)
         crop = RandomCrop(image_keys=OBS_KEYS, size=(24, 24), pad=4)
         out1 = crop(batch)
         out2 = crop(batch)
-        # Two crops should (very likely) differ
         assert not torch.allclose(out1[OBS_KEYS[0]], out2[OBS_KEYS[0]])
 
     def test_color_jitter_range(self):
-        from robo_dataset.transforms.cpu_batch import ActionChunk
         from robo_dataset.transforms.gpu_batch import ColorJitter
-        batch = _make_batch()
-        cpu = ActionChunk(n_obs_steps=4, image_keys=OBS_KEYS)
-        batch = cpu(batch)
+        batch = _cpu_processed_batch(n_obs=4)
         jitter = ColorJitter(image_keys=OBS_KEYS, brightness=0.2, contrast=0.2)
         out = jitter(batch)
         assert out[OBS_KEYS[0]].min() >= 0.0

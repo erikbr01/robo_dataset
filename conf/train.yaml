@@ -1,7 +1,8 @@
 defaults:
   - store: zarr_disk
+  - shape_meta: robomimic_lift_ph
   - transforms/disk@disk_transforms: resize
-  - transforms/cpu@cpu_transform: action_chunk
+  - transforms/cpu@cpu_transform: split_obs_image
   - transforms/gpu@gpu_transform: random_crop
   - _self_
 
@@ -25,9 +26,6 @@ num_workers: 8
 cache:
   enabled: true
   root: /tmp/robo_dataset_cache
-  image_keys:
-    - agentview_image
-    - robot0_eye_in_hand_image
 
 # Training
 max_epochs: 100

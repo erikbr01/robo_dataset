@@ -1,0 +1,18 @@
+# ComposeCPU: slice obs window then convert images to tensors.
+# obs_keys and image_keys must match the active shape_meta.
+# n_obs_steps is interpolated from the root config.
+_target_: robo_dataset.transforms.cpu_batch.ComposeCPU
+transforms:
+  - _target_: robo_dataset.transforms.cpu_batch.SplitObsAction
+    n_obs_steps: ${n_obs_steps}
+    obs_keys:
+      - agentview_image
+      - robot0_eye_in_hand_image
+      - robot0_eef_pos
+      - robot0_eef_quat
+      - robot0_gripper_qpos
+    action_key: action
+  - _target_: robo_dataset.transforms.cpu_batch.ImageToTensor
+    image_keys:
+      - agentview_image
+      - robot0_eye_in_hand_image

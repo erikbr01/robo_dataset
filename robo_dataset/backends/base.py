@@ -80,6 +80,11 @@ class WritableTrajectoryStore(TrajectoryStore, ABC):
     ) -> "WritableTrajectoryStore":
         """Create a new empty writable store at path."""
 
+    @classmethod
+    @abstractmethod
+    def open_readonly(cls, path: str) -> TrajectoryStore:
+        """Open an existing store written by this class for reading."""
+
     @abstractmethod
     def put_episode(self, data: Dict[str, np.ndarray]) -> None:
         """Write one episode. data[key] must have shape (T, *frame_shape(key))."""

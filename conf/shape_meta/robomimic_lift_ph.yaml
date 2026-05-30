@@ -1,0 +1,18 @@
+obs:
+  agentview_image:
+    type: rgb
+    shape: [84, 84, 3]
+  robot0_eye_in_hand_image:
+    type: rgb
+    shape: [84, 84, 3]
+  robot0_eef_pos:
+    type: low_dim
+    shape: [3]
+  robot0_eef_quat:
+    type: low_dim
+    shape: [4]
+  robot0_gripper_qpos:
+    type: low_dim
+    shape: [2]
+action:
+  shape: [7]

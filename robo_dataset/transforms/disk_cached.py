@@ -1,12 +1,13 @@
-"""Disk-cached transform: apply an offline transform and cache in a ZarrStoreWriter.
+"""Disk-cached transform: apply an offline transform and cache the result.
 
-The cache is stored under `<cache_root>/<cache_key>/` using the same storage backend
-as the target (ZarrStoreWriter by default). If the directory already exists and
-contains a valid `meta.json`, the transform is skipped and the cached store is returned.
+Cache lives under `<cache_root>/<cache_key>/` as a ZarrStore (default) or any
+WritableTrajectoryStore subclass passed via writer_cls.  On a cache hit (meta.json
+already exists), the transform is skipped entirely and the cached store is opened.
 
-Cache key = sha256(source_code(apply_episode) + repr(config_dict))[:16]
-Limitation: the hash only covers the class source and explicit config, not imported helpers.
-Set `version` in the config to bust the cache when deps change.
+Cache key = sha256(apply_episode source code + repr(config))[:16]
+Limitation: the hash covers the class source and __dict__ values, but not imported
+helpers or library versions.  Use the `version` field on your transform class to
+bust the cache when dependencies change.
 """
 
 import logging
@@ -17,8 +18,7 @@ from typing import Any, Dict, List, Optional, Type
 import numpy as np
 
 from ..backends.base import TrajectoryStore, WritableTrajectoryStore
-from ..backends.zarr_backend import ZarrStore, ZarrStoreWriter
-from ..convert import convert
+from ..backends.zarr_backend import ZarrStoreWriter
 from .base import DiskCachedTransform
 
 log = logging.getLogger(__name__)
@@ -35,8 +35,8 @@ def apply_disk_cached(
     """
     Apply transform to source and cache result under cache_root/<cache_key>/.
 
-    If cache already exists (and force=False), opens and returns it immediately.
-    The returned store is a read-only ZarrStore (or writer_cls's read counterpart).
+    Uses writer_cls to write the cache and writer_cls.open_readonly() to re-open it.
+    The writer is created lazily from the first transformed episode — no double iteration.
     """
     cache_key = transform.cache_key()
     cache_path = os.path.join(cache_root, cache_key)
@@ -44,37 +44,30 @@ def apply_disk_cached(
 
     if not force and os.path.exists(meta_file):
         log.info(f"[disk_cache] HIT  {cache_key}  {cache_path}")
-        return ZarrStore(cache_path)
+        return writer_cls.open_readonly(cache_path)
 
     if force and os.path.exists(cache_path):
         shutil.rmtree(cache_path)
 
     log.info(f"[disk_cache] MISS {cache_key}  → building {cache_path}")
 
-    # Probe shapes/dtypes from a single episode to set up writer
-    first_ep = next(source.iter_episodes())
-    transformed_first = transform.apply_episode(first_ep)
-    key_shapes = {k: v.shape[1:] for k, v in transformed_first.items()}
-    key_dtypes = {k: v.dtype for k, v in transformed_first.items()}
+    writer = None
+    for ep_data in source.iter_episodes():
+        transformed = transform.apply_episode(ep_data)
+        if writer is None:
+            writer = writer_cls.create(
+                path=cache_path,
+                key_shapes={k: v.shape[1:] for k, v in transformed.items()},
+                key_dtypes={k: v.dtype for k, v in transformed.items()},
+                image_keys=list(image_keys),
+            )
+        writer.put_episode(transformed)
 
-    writer = ZarrStoreWriter.create(
-        path=cache_path,
-        key_shapes=key_shapes,
-        key_dtypes=key_dtypes,
-        image_keys=list(image_keys),
-    )
-    # Write first episode (already transformed above)
-    writer.put_episode(transformed_first)
-
-    # Stream remaining episodes
-    for ep_idx, ep_data in enumerate(source.iter_episodes()):
-        if ep_idx == 0:
-            continue  # already written
-        writer.put_episode(transform.apply_episode(ep_data))
-
+    if writer is None:
+        raise ValueError("Source store is empty — nothing to cache.")
     writer.finalize()
     log.info(f"[disk_cache] DONE {cache_key}")
-    return ZarrStore(cache_path)
+    return writer_cls.open_readonly(cache_path)
 
 
 # ── Built-in disk transforms ──────────────────────────────────────────────────

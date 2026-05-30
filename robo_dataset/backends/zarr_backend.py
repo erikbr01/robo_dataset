@@ -26,8 +26,6 @@ _META_FILE = "meta.json"
 def _open_zarr_array(path: str, mode: str, **kwargs) -> zarr.Array:
     """Open/create zarr array, forcing zarr_format=2 in zarr v3 for compressor support."""
     if _ZARR_MAJOR >= 3 and mode == "w":
-        # zarr3 defaults to format=3, which doesn't support numcodecs compressors directly.
-        # Force format=2 so compressor= still works.
         kwargs.setdefault("zarr_format", 2)
     return zarr.open(path, mode=mode, **kwargs)
 
@@ -38,9 +36,9 @@ def _zarr_append(arr: zarr.Array, data: np.ndarray) -> None:
     old = arr.shape[0]
     new_shape = (old + T,) + tuple(arr.shape[1:])
     try:
-        arr.resize(new_shape)            # zarr v3: resize(tuple)
+        arr.resize(new_shape)
     except TypeError:
-        arr.resize(old + T, *arr.shape[1:])  # zarr v2: resize(*args)
+        arr.resize(old + T, *arr.shape[1:])
     arr[old : old + T] = data
 
 
@@ -56,7 +54,6 @@ def _jpeg_compressor() -> numcodecs.abc.Codec:
         return numcodecs.registry.get_codec({"id": "imagecodecs_jpeg", "quality": _JPEG_QUALITY})
     except Exception:
         pass
-    # Lossless fallback
     return numcodecs.Blosc(cname="lz4", clevel=1)
 
 
@@ -67,8 +64,7 @@ class ZarrStore(TrajectoryStore):
 
     def __init__(self, path: str):
         self.path = path
-        meta_path = os.path.join(path, _META_FILE)
-        with open(meta_path) as f:
+        with open(os.path.join(path, _META_FILE)) as f:
             meta = json.load(f)
 
         self._keys: List[str] = meta["keys"]
@@ -81,8 +77,7 @@ class ZarrStore(TrajectoryStore):
     def _open_arrays(self) -> None:
         self._arrays = {}
         for key in self._keys:
-            arr_path = os.path.join(self.path, "data", key)
-            self._arrays[key] = zarr.open(arr_path, mode="r")
+            self._arrays[key] = zarr.open(os.path.join(self.path, "data", key), mode="r")
 
     def on_worker_init(self, worker_id: int) -> None:
         self._open_arrays()
@@ -133,13 +128,16 @@ class ZarrStoreWriter(WritableTrajectoryStore):
     ) -> "ZarrStoreWriter":
         return cls(path=path, image_keys=image_keys)
 
+    @classmethod
+    def open_readonly(cls, path: str) -> ZarrStore:
+        return ZarrStore(path)
+
     def _get_or_create_array(self, key: str, frame: np.ndarray) -> zarr.Array:
         if key in self._arrays:
             return self._arrays[key]
 
         arr_path = os.path.join(self.path, "data", key)
         compressor = _jpeg_compressor() if key in self._image_keys else numcodecs.Blosc(cname="lz4", clevel=1)
-
         arr = _open_zarr_array(
             arr_path,
             mode="w",

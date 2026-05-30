@@ -16,10 +16,13 @@ class TrajectoryDataset(Dataset):
     Torch Dataset over a TrajectoryStore.
 
     Returns dict of tensors with shape (horizon, *frame_shape) per key.
-    Image keys are kept as uint8; callers should normalize as needed.
+    Image keys are kept as uint8; format conversion happens in the CPU transform.
 
     For use with DataLoader, pass worker_init_fn=TrajectoryDataset.worker_init_fn.
-    For distributed training, wrap with torch.utils.data.DistributedSampler.
+    For distributed training, pass sampler=torch.utils.data.DistributedSampler(dataset).
+
+    Invariant: _episode_mask is always a valid bool ndarray of length n_episodes,
+    never None. When val_ratio=0 the train mask is all-True.
     """
 
     def __init__(
@@ -39,9 +42,11 @@ class TrajectoryDataset(Dataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
 
-        if episode_mask is None and val_ratio > 0:
+        # Always materialise a bool mask — never store None.
+        if episode_mask is None:
             val_mask = get_val_mask(store.n_episodes, val_ratio, seed)
-            episode_mask = ~val_mask
+            episode_mask = ~val_mask   # train mask; all-True when val_ratio=0
+        self._episode_mask = episode_mask
 
         self._sampler = SequenceSampler(
             store=store,
@@ -50,11 +55,11 @@ class TrajectoryDataset(Dataset):
             pad_after=pad_after,
             keys=keys,
             key_first_k=key_first_k,
-            episode_mask=episode_mask,
+            episode_mask=self._episode_mask,
         )
-        self._episode_mask = episode_mask
 
     def get_validation_dataset(self) -> "TrajectoryDataset":
+        """Return a dataset over the held-out episodes (complement of episode_mask)."""
         val = copy.copy(self)
         val._episode_mask = ~self._episode_mask
         val._sampler = SequenceSampler(
@@ -91,7 +96,7 @@ class TrajectoryDataset(Dataset):
         sampler=None,
         **kwargs,
     ) -> torch.utils.data.DataLoader:
-        """Convenience method; returns a DataLoader with correct worker_init_fn."""
+        """Convenience factory; wires worker_init_fn automatically."""
         return torch.utils.data.DataLoader(
             self,
             batch_size=batch_size,

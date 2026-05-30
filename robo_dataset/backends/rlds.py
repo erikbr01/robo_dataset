@@ -1,13 +1,13 @@
-"""RLDS/TFRecord backend (read-only for now).
+"""RLDS/TFRecord backend (read + write).
 
 Layout on disk:
   <path>/frames.tfrecord     one tf.train.Example per frame
-  <path>/frames.index        text file: one row per frame, "offset length"
+  <path>/frames.index        text file: one byte offset per line
   <path>/meta.json           key shapes, dtypes, image_keys, n_frames, episode_ends
 
-Each Example has one feature per key:
-  - Image keys: JPEG bytes     → bytes_list
-  - Other keys: raw float32    → bytes_list (raw bytes, shape in meta)
+Each Example has one bytes_list feature per key:
+  - Image keys: JPEG bytes
+  - Other keys: raw float32 bytes (shape/dtype recorded in meta.json)
 """
 
 import json
@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
-from .base import TrajectoryStore
+from .base import TrajectoryStore, WritableTrajectoryStore
 
 _TFRECORD_FILE = "frames.tfrecord"
 _INDEX_FILE = "frames.index"
@@ -45,7 +45,6 @@ def _read_record(f, offset: int) -> bytes:
 
 
 def _write_record(f, data: bytes) -> int:
-    """Write one TFRecord record, return the byte offset where it was written."""
     offset = f.tell()
     length = len(data)
     len_bytes = struct.pack("<Q", length)
@@ -58,8 +57,7 @@ def _write_record(f, data: bytes) -> int:
 
 # ── Example proto helpers ─────────────────────────────────────────────────────
 
-def _make_example(features: Dict[str, bytes]):
-    """Build a tf.train.Example with one bytes_list feature per key."""
+def _make_example(features: Dict[str, bytes]) -> bytes:
     from tfrecord import example_pb2
     ex = example_pb2.Example()
     for key, blob in features.items():
@@ -74,73 +72,7 @@ def _parse_example(raw: bytes, keys: List[str]) -> Dict[str, bytes]:
     return {key: bytes(ex.features.feature[key].bytes_list.value[0]) for key in keys}
 
 
-# ── Writer ────────────────────────────────────────────────────────────────────
-
-class RLDSFrameStoreWriter:
-    """Streaming writer for the RLDS frame format."""
-
-    def __init__(self, path: str, image_keys: List[str], jpeg_quality: int = 75):
-        self.path = path
-        self.image_keys = set(image_keys)
-        self.jpeg_quality = jpeg_quality
-        os.makedirs(path, exist_ok=True)
-
-        self._tfr_path = os.path.join(path, _TFRECORD_FILE)
-        self._idx_path = os.path.join(path, _INDEX_FILE)
-        self._f = open(self._tfr_path, "wb")
-        self._offsets: List[int] = []
-        self._episode_ends: List[int] = []
-        self._n_frames = 0
-
-        self._shapes: Dict[str, tuple] = {}
-        self._dtypes: Dict[str, str] = {}
-
-    def write_frame(self, frame_data: Dict[str, np.ndarray]) -> None:
-        features = {}
-        for key, arr in frame_data.items():
-            if key in self.image_keys:
-                features[key] = _encode_jpeg(arr, self.jpeg_quality)
-            else:
-                if key not in self._shapes:
-                    self._shapes[key] = arr.shape
-                    self._dtypes[key] = str(arr.dtype)
-                features[key] = arr.astype(np.float32).tobytes()
-        offset = _write_record(self._f, _make_example(features))
-        self._offsets.append(offset)
-        self._n_frames += 1
-
-    def end_episode(self) -> None:
-        self._episode_ends.append(self._n_frames)
-
-    def finalize(self, key_shapes: Dict[str, tuple] = None, key_dtypes: Dict[str, np.dtype] = None):
-        self._f.close()
-        # Write index
-        with open(self._idx_path, "w") as f:
-            for offset in self._offsets:
-                # length = next offset - current - 16 header bytes; easier to re-read
-                f.write(f"{offset}\n")
-        # Merge shapes/dtypes
-        if key_shapes:
-            for k, v in key_shapes.items():
-                if k not in self._shapes:
-                    self._shapes[k] = tuple(v)
-        if key_dtypes:
-            for k, v in key_dtypes.items():
-                if k not in self._dtypes:
-                    self._dtypes[k] = str(np.dtype(v))
-        meta = {
-            "n_frames": self._n_frames,
-            "episode_ends": self._episode_ends,
-            "shapes": {k: list(v) for k, v in self._shapes.items()},
-            "dtypes": self._dtypes,
-            "image_keys": list(self.image_keys),
-        }
-        with open(os.path.join(self.path, _META_FILE), "w") as f:
-            json.dump(meta, f, indent=2)
-
-
 def _encode_jpeg(img: np.ndarray, quality: int) -> bytes:
-    """Encode HWC uint8 image as JPEG bytes."""
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
     _, buf = cv2.imencode(".jpg", img, encode_param)
     return buf.tobytes()
@@ -153,8 +85,7 @@ class RLDSFrameStore(TrajectoryStore):
 
     def __init__(self, path: str):
         self.path = path
-        meta_path = os.path.join(path, _META_FILE)
-        with open(meta_path) as f:
+        with open(os.path.join(path, _META_FILE)) as f:
             meta = json.load(f)
 
         self._all_keys: List[str] = list(meta["shapes"].keys())
@@ -162,16 +93,11 @@ class RLDSFrameStore(TrajectoryStore):
         self._shapes: Dict[str, tuple] = {k: tuple(v) for k, v in meta["shapes"].items()}
         self._dtypes: Dict[str, str] = meta["dtypes"]
         self._episode_ends = np.array(meta["episode_ends"], dtype=np.int64)
-        self._n_frames = meta["n_frames"]
 
         self._tfr_path = os.path.join(path, _TFRECORD_FILE)
-        self._idx_path = os.path.join(path, _INDEX_FILE)
+        with open(os.path.join(path, _INDEX_FILE)) as f:
+            self._offsets = np.array([int(l.strip()) for l in f if l.strip()], dtype=np.int64)
 
-        # Load offset index
-        with open(self._idx_path) as f:
-            self._offsets = np.array([int(line.strip()) for line in f if line.strip()], dtype=np.int64)
-
-        # Per-thread file handles (DataLoader workers + main thread)
         self._local = threading.local()
 
     def _fh(self):
@@ -180,7 +106,6 @@ class RLDSFrameStore(TrajectoryStore):
         return self._local.f
 
     def on_worker_init(self, worker_id: int) -> None:
-        # Close any inherited handle and reopen fresh
         if hasattr(self._local, "f") and self._local.f is not None:
             self._local.f.close()
         self._local.f = open(self._tfr_path, "rb")
@@ -204,15 +129,12 @@ class RLDSFrameStore(TrajectoryStore):
         frames = []
         for i in range(start, end):
             raw = _read_record(fh, int(self._offsets[i]))
-            parsed = _parse_example(raw, [key])
-            blob = parsed[key]
+            blob = _parse_example(raw, [key])[key]
             if key in self._image_keys:
                 img = cv2.imdecode(np.frombuffer(blob, np.uint8), cv2.IMREAD_COLOR)
                 frames.append(img)
             else:
-                dtype = np.dtype(self._dtypes[key])
-                shape = self._shapes[key]
-                arr = np.frombuffer(blob, dtype=np.float32).reshape(shape)
+                arr = np.frombuffer(blob, dtype=np.float32).reshape(self._shapes[key])
                 frames.append(arr)
         return np.stack(frames)
 
@@ -222,3 +144,123 @@ class RLDSFrameStore(TrajectoryStore):
                 self._local.f.close()
             except Exception:
                 pass
+
+
+# ── Writer ────────────────────────────────────────────────────────────────────
+
+class RLDSFrameStoreWriter(WritableTrajectoryStore):
+    """Streaming writer for the RLDS frame format.
+
+    Implements WritableTrajectoryStore so it can be used as a conversion target
+    and as a disk-cache backend in apply_disk_cached().
+
+    After finalize(), the read interface delegates to an internal RLDSFrameStore.
+    Before finalize(), read calls raise RuntimeError.
+    """
+
+    def __init__(self, path: str, image_keys: List[str], jpeg_quality: int = 75):
+        self.path = path
+        self.image_keys = set(image_keys)
+        self.jpeg_quality = jpeg_quality
+        os.makedirs(path, exist_ok=True)
+
+        self._tfr_path = os.path.join(path, _TFRECORD_FILE)
+        self._idx_path = os.path.join(path, _INDEX_FILE)
+        self._f = open(self._tfr_path, "wb")
+        self._offsets: List[int] = []
+        self._episode_ends_list: List[int] = []
+        self._n_frames = 0
+        self._shapes: Dict[str, tuple] = {}
+        self._dtypes: Dict[str, str] = {}
+        self._reader: Optional[RLDSFrameStore] = None
+
+    @classmethod
+    def create(
+        cls,
+        path: str,
+        key_shapes: Dict[str, tuple],
+        key_dtypes: Dict[str, np.dtype],
+        image_keys: List[str] = (),
+        **kwargs,
+    ) -> "RLDSFrameStoreWriter":
+        writer = cls(path=path, image_keys=image_keys, jpeg_quality=kwargs.get("jpeg_quality", 75))
+        # Pre-populate shapes/dtypes for non-image keys (image shapes come from first frame)
+        for k, shape in key_shapes.items():
+            if k not in writer.image_keys:
+                writer._shapes[k] = tuple(shape)
+                writer._dtypes[k] = str(np.dtype(key_dtypes[k]))
+        return writer
+
+    @classmethod
+    def open_readonly(cls, path: str) -> RLDSFrameStore:
+        return RLDSFrameStore(path)
+
+    def _write_frame(self, frame_data: Dict[str, np.ndarray]) -> None:
+        features = {}
+        for key, arr in frame_data.items():
+            if key in self.image_keys:
+                if key not in self._shapes:
+                    self._shapes[key] = arr.shape
+                    self._dtypes[key] = str(arr.dtype)
+                features[key] = _encode_jpeg(arr, self.jpeg_quality)
+            else:
+                if key not in self._shapes:
+                    self._shapes[key] = arr.shape
+                    self._dtypes[key] = str(arr.dtype)
+                features[key] = arr.astype(np.float32).tobytes()
+        offset = _write_record(self._f, _make_example(features))
+        self._offsets.append(offset)
+        self._n_frames += 1
+
+    def put_episode(self, data: Dict[str, np.ndarray]) -> None:
+        assert self._reader is None, "Cannot write after finalize()"
+        T = next(iter(data.values())).shape[0]
+        for t in range(T):
+            self._write_frame({k: data[k][t] for k in data})
+        self._episode_ends_list.append(self._n_frames)
+
+    def finalize(self) -> None:
+        self._f.close()
+        with open(self._idx_path, "w") as f:
+            for offset in self._offsets:
+                f.write(f"{offset}\n")
+        meta = {
+            "n_frames": self._n_frames,
+            "episode_ends": self._episode_ends_list,
+            "shapes": {k: list(v) for k, v in self._shapes.items()},
+            "dtypes": self._dtypes,
+            "image_keys": list(self.image_keys),
+        }
+        with open(os.path.join(self.path, _META_FILE), "w") as f:
+            json.dump(meta, f, indent=2)
+        self._reader = RLDSFrameStore(self.path)
+
+    # ── Read interface — delegates to RLDSFrameStore after finalize ───────────
+
+    def _require_finalized(self):
+        if self._reader is None:
+            raise RuntimeError("RLDSFrameStoreWriter: call finalize() before reading")
+
+    @property
+    def episode_ends(self) -> np.ndarray:
+        if self._reader is not None:
+            return self._reader.episode_ends
+        return np.array(self._episode_ends_list, dtype=np.int64)
+
+    @property
+    def keys(self) -> List[str]:
+        return list(self._shapes.keys())
+
+    def frame_shape(self, key: str) -> tuple:
+        return self._shapes[key]
+
+    def frame_dtype(self, key: str) -> np.dtype:
+        return np.dtype(self._dtypes.get(key, "float32"))
+
+    def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
+        self._require_finalized()
+        return self._reader.get_sequence(key, start, end)
+
+    def on_worker_init(self, worker_id: int) -> None:
+        self._require_finalized()
+        self._reader.on_worker_init(worker_id)

@@ -163,3 +163,138 @@ class TestDataLoader:
         loader = dataset.make_dataloader(batch_size=4, num_workers=0, shuffle=False)
         batch = next(iter(loader))
         assert batch[OBS_KEYS[0]].shape == (4, 4, H, W, C)
+
+
+# ── convert() coverage ────────────────────────────────────────────────────────
+
+class TestConvert:
+    def test_convert_with_transform(self, synthetic_hdf5, tmp_path):
+        """convert() transform= argument is applied per episode before writing."""
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.zarr_backend import ZarrStore, ZarrStoreWriter
+        from robo_dataset.convert import convert
+
+        src = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+
+        scale_factor = 2.0
+        def double_action(ep):
+            out = dict(ep)
+            out["action"] = ep["action"] * scale_factor
+            return out
+
+        out_path = str(tmp_path / "zarr_transformed")
+        writer = ZarrStoreWriter.create(
+            path=out_path,
+            key_shapes={k: src.frame_shape(k) for k in src.keys},
+            key_dtypes={k: src.frame_dtype(k) for k in src.keys},
+            image_keys=OBS_KEYS,
+        )
+        convert(src, writer, transform=double_action, verbose=False)
+
+        dst = ZarrStore(out_path)
+        orig_action = src.get_sequence("action", 0, src.n_frames)
+        conv_action = dst.get_sequence("action", 0, dst.n_frames)
+        np.testing.assert_allclose(conv_action, orig_action * scale_factor, rtol=1e-5)
+
+    def test_convert_key_subset(self, synthetic_hdf5, tmp_path):
+        """convert() keys= argument writes only the requested subset."""
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.zarr_backend import ZarrStore, ZarrStoreWriter
+        from robo_dataset.convert import convert
+
+        src = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        subset = [OBS_KEYS[0], "action"]
+
+        out_path = str(tmp_path / "zarr_subset")
+        writer = ZarrStoreWriter.create(
+            path=out_path,
+            key_shapes={k: src.frame_shape(k) for k in subset},
+            key_dtypes={k: src.frame_dtype(k) for k in subset},
+            image_keys=[OBS_KEYS[0]],
+        )
+        convert(src, writer, keys=subset, verbose=False)
+
+        dst = ZarrStore(out_path)
+        assert set(dst.keys) == set(subset)
+
+    def test_zarr_to_zarr(self, zarr_store_path, tmp_path):
+        """convert() works with a zarr source (not just HDF5)."""
+        from robo_dataset.backends.zarr_backend import ZarrStore, ZarrStoreWriter
+        from robo_dataset.convert import convert
+
+        src = ZarrStore(zarr_store_path)
+        out_path = str(tmp_path / "zarr2zarr")
+        writer = ZarrStoreWriter.create(
+            path=out_path,
+            key_shapes={k: src.frame_shape(k) for k in src.keys},
+            key_dtypes={k: src.frame_dtype(k) for k in src.keys},
+            image_keys=OBS_KEYS,
+        )
+        convert(src, writer, verbose=False)
+
+        dst = ZarrStore(out_path)
+        assert dst.n_episodes == src.n_episodes
+        np.testing.assert_array_equal(dst.episode_ends, src.episode_ends)
+        orig = src.get_sequence("action", 0, src.n_frames)
+        copy = dst.get_sequence("action", 0, dst.n_frames)
+        np.testing.assert_array_equal(orig, copy)
+
+    def test_convert_rlds_from_zarr(self, zarr_store_path, tmp_path):
+        """convert_rlds() works with a zarr source (non-HDF5 input path)."""
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.rlds import RLDSFrameStore
+        from robo_dataset.convert import convert_rlds
+
+        src = ZarrStore(zarr_store_path)
+        out_path = str(tmp_path / "zarr_to_rlds")
+        convert_rlds(src, out_path, image_keys=OBS_KEYS, jpeg_quality=95, verbose=False)
+
+        dst = RLDSFrameStore(out_path)
+        assert dst.n_episodes == src.n_episodes
+        np.testing.assert_array_equal(dst.episode_ends, src.episode_ends)
+        # action must be bit-exact
+        orig = src.get_sequence("action", 0, src.n_frames)
+        copy = dst.get_sequence("action", 0, dst.n_frames)
+        np.testing.assert_allclose(orig, copy, atol=1e-5)
+
+
+# ── apply_disk_cached with RLDS writer ────────────────────────────────────────
+
+class TestDiskCacheRLDSWriter:
+    def test_rlds_as_cache_writer(self, synthetic_hdf5, tmp_path):
+        """apply_disk_cached() produces a valid RLDS store when writer_cls=RLDSFrameStoreWriter."""
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.rlds import RLDSFrameStore, RLDSFrameStoreWriter
+        from robo_dataset.transforms.disk_cached import ResizeImages, apply_disk_cached
+
+        src = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        transform = ResizeImages(image_keys=OBS_KEYS, target_h=16, target_w=16)
+        cached = apply_disk_cached(
+            src, transform,
+            cache_root=str(tmp_path),
+            image_keys=OBS_KEYS,
+            writer_cls=RLDSFrameStoreWriter,
+        )
+
+        assert isinstance(cached, RLDSFrameStore)
+        assert cached.n_episodes == src.n_episodes
+        seq = cached.get_sequence(OBS_KEYS[0], 0, 3)
+        assert seq.shape == (3, 16, 16, C)
+
+    def test_rlds_cache_hit(self, synthetic_hdf5, tmp_path):
+        """Second call returns cached RLDS store without re-running the transform."""
+        import os
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.rlds import RLDSFrameStoreWriter
+        from robo_dataset.transforms.disk_cached import ResizeImages, apply_disk_cached
+
+        src = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        transform = ResizeImages(image_keys=OBS_KEYS, target_h=16, target_w=16)
+        apply_disk_cached(src, transform, cache_root=str(tmp_path),
+                          image_keys=OBS_KEYS, writer_cls=RLDSFrameStoreWriter)
+        cache_path = os.path.join(str(tmp_path), transform.cache_key())
+        mtime_before = os.path.getmtime(os.path.join(cache_path, "meta.json"))
+        apply_disk_cached(src, transform, cache_root=str(tmp_path),
+                          image_keys=OBS_KEYS, writer_cls=RLDSFrameStoreWriter)
+        mtime_after = os.path.getmtime(os.path.join(cache_path, "meta.json"))
+        assert mtime_before == mtime_after

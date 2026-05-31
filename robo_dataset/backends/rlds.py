@@ -81,7 +81,30 @@ def _encode_jpeg(img: np.ndarray, quality: int) -> bytes:
 # ── Reader ────────────────────────────────────────────────────────────────────
 
 class RLDSFrameStore(TrajectoryStore):
-    """Read-only random-access RLDS/TFRecord per-frame store."""
+    """Read-only random-access RLDS/TFRecord per-frame store.
+
+    Pros
+    ----
+    - Single file: one open() per worker regardless of dataset size → no inode
+      overhead. At 12 workers this is 12 opens vs. zarr's ~232k per epoch.
+    - O(1) random access via the companion .index file (byte offsets, one per frame).
+    - Highest DataLoader throughput on local SSD (≈ 2× zarr_disk_jpeg at 12 workers,
+      see benchmarks/rlds_bench_results.json).
+    - TFRecord format is compatible with tf.data for TensorFlow-side consumers.
+    - JPEG compression is applied per frame at write time; no additional codec needed.
+
+    Cons
+    ----
+    - No vectorized access: get_sequence(key, start, end) issues (end - start)
+      individual seeks — one per frame. For a horizon-16 window that is 16 seeks
+      vs. zarr's single array slice. CPU cost (protobuf + JPEG decode) dominates on
+      fast SSDs, but the seek count matters for slow storage.
+    - Two-file layout: .tfrecord + .index must be kept together. Deleting or
+      misplacing the index makes random access impossible.
+    - Write-once: appending to an existing TFRecord is not supported.
+    - Requires protobuf and crc32c as runtime dependencies.
+    - JPEG is lossy; not appropriate when bit-exact fidelity is required.
+    """
 
     def __init__(self, path: str):
         self.path = path
@@ -156,6 +179,7 @@ class RLDSFrameStoreWriter(WritableTrajectoryStore):
 
     After finalize(), the read interface delegates to an internal RLDSFrameStore.
     Before finalize(), read calls raise RuntimeError.
+    Same pros/cons as RLDSFrameStore apply after finalize().
     """
 
     def __init__(self, path: str, image_keys: List[str], jpeg_quality: int = 75):

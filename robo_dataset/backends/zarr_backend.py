@@ -60,7 +60,26 @@ def _jpeg_compressor() -> numcodecs.abc.Codec:
 # ── Read-only store ───────────────────────────────────────────────────────────
 
 class ZarrStore(TrajectoryStore):
-    """Read-only view of an existing zarr dataset on disk."""
+    """Read-only view of an existing zarr dataset on disk.
+
+    Pros
+    ----
+    - Vectorized slice: array[start:end] is a single decompression call for a
+      contiguous chunk, avoiding per-frame syscall overhead for large horizons.
+    - Flexible compression: lz4, zstd, JPEG, J2K, WebP via numcodecs (set at
+      write time; read side is transparent).
+    - Fork-safe: arrays are reopened in on_worker_init via fresh zarr.open calls.
+    - Standard open format supported by many tools beyond this library.
+
+    Cons
+    ----
+    - One file per chunk (default: chunks=(1, H, W, C)) → one open() syscall per
+      frame per key. At 12 workers × 9666 frames × 2 keys ≈ 232k file opens per
+      epoch — inode/VFS overhead dominates at high worker counts (see benchmarks).
+    - On-disk directory tree scales linearly with frame count; stat() calls add up.
+    - zarr v2/v3 API incompatibility: zarr_format=2 must be forced in v3 to keep
+      numcodecs compressors working (see _open_zarr_array helper).
+    """
 
     def __init__(self, path: str):
         self.path = path
@@ -103,7 +122,12 @@ class ZarrStore(TrajectoryStore):
 # ── Write-once store ──────────────────────────────────────────────────────────
 
 class ZarrStoreWriter(WritableTrajectoryStore):
-    """Write-once zarr store that accumulates episodes and finalizes."""
+    """Write-once zarr store that accumulates episodes and finalizes.
+
+    Implements WritableTrajectoryStore so it can be used as a conversion target
+    and as a disk-cache backend in apply_disk_cached().
+    Same pros/cons as ZarrStore apply after finalize().
+    """
 
     def __init__(self, path: str, image_keys: List[str] = ()):
         self.path = path

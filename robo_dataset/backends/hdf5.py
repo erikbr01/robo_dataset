@@ -17,7 +17,25 @@ from .base import TrajectoryStore
 
 
 class RobomimicHDF5Store(TrajectoryStore):
-    """Read-only flat-frame view over a Robomimic HDF5 dataset."""
+    """Read-only flat-frame view over a Robomimic HDF5 dataset.
+
+    Pros
+    ----
+    - Zero setup: train directly from the original Robomimic HDF5 without conversion.
+    - Cross-episode sequences stitched automatically via searchsorted + multi-read.
+    - Supports arbitrary h5py compression codecs (depends on how the file was created).
+
+    Cons
+    ----
+    - Not fork-safe: h5py file handles must be reopened per DataLoader worker
+      (handled by on_worker_init, but adds latency on first access after fork).
+    - No vectorized slice: a single get_sequence call spanning E episodes issues E
+      separate HDF5 reads, each with its own decompression step.
+    - Images are typically stored uncompressed in Robomimic files → large disk footprint.
+    - Read-only: no write path (use ZarrStoreWriter or RLDSFrameStoreWriter to convert).
+    - abs_action / rotation_rep parameters create a soft dependency on diffusion_policy
+      for anything other than the default axis_angle representation.
+    """
 
     def __init__(
         self,

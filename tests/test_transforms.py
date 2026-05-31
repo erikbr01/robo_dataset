@@ -384,3 +384,77 @@ class TestDataPrefetcherXPU:
         loader = _make_loader(n=8, batch_size=4)
         for batch in DataPrefetcher(loader, device="xpu:0"):
             assert batch[OBS_KEYS[0]].device.type == "xpu"
+
+
+# ── DataPrefetcher pin_memory warning ─────────────────────────────────────────
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestDataPrefetcherPinMemoryWarning:
+    def test_warns_when_pin_memory_false(self):
+        import warnings
+        from robo_dataset.prefetch import DataPrefetcher
+        loader = _make_loader(pin_memory=False)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            DataPrefetcher(loader, device="cuda:0")
+        assert any("pin_memory" in str(warning.message).lower() for warning in w)
+
+    def test_no_warning_when_pin_memory_true(self):
+        import warnings
+        from robo_dataset.prefetch import DataPrefetcher
+        loader = _make_loader(pin_memory=True)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            DataPrefetcher(loader, device="cuda:0")
+        assert not any("pin_memory" in str(warning.message).lower() for warning in w)
+
+
+# ── ChannelsLastGPU ───────────────────────────────────────────────────────────
+
+class TestChannelsLastGPU:
+    """ChannelsLastGPU: applies channels_last to 4D, passes through 5D."""
+
+    def test_4d_gets_channels_last(self):
+        from robo_dataset.transforms.gpu_batch import ChannelsLastGPU
+        t = ChannelsLastGPU(image_keys=OBS_KEYS)
+        # (N, C, H, W) float32 — typical single-frame batch
+        batch = {k: torch.randn(8, C, H, W) for k in OBS_KEYS}
+        out = t(batch)
+        for key in OBS_KEYS:
+            assert out[key].is_contiguous(memory_format=torch.channels_last), (
+                f"{key}: expected channels_last, got strides {out[key].stride()}"
+            )
+
+    def test_5d_passes_through_unchanged(self):
+        from robo_dataset.transforms.gpu_batch import ChannelsLastGPU
+        t = ChannelsLastGPU(image_keys=OBS_KEYS)
+        # (B, T, C, H, W) — sequence batch; channels_last is undefined for 5D
+        batch = {k: torch.randn(4, 8, C, H, W) for k in OBS_KEYS}
+        out = t(batch)
+        for key in OBS_KEYS:
+            assert out[key] is batch[key], "5D tensor should be passed through unchanged"
+
+    def test_missing_key_skipped(self):
+        from robo_dataset.transforms.gpu_batch import ChannelsLastGPU
+        t = ChannelsLastGPU(image_keys=["nonexistent"] + OBS_KEYS)
+        batch = {k: torch.randn(8, C, H, W) for k in OBS_KEYS}
+        out = t(batch)  # must not raise
+        assert out[OBS_KEYS[0]].is_contiguous(memory_format=torch.channels_last)
+
+    def test_non_image_keys_unchanged(self):
+        from robo_dataset.transforms.gpu_batch import ChannelsLastGPU
+        t = ChannelsLastGPU(image_keys=OBS_KEYS)
+        action = torch.randn(8, ACTION_DIM)
+        batch = {k: torch.randn(8, C, H, W) for k in OBS_KEYS}
+        batch["action"] = action
+        out = t(batch)
+        assert out["action"] is action
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_4d(self):
+        from robo_dataset.transforms.gpu_batch import ChannelsLastGPU
+        t = ChannelsLastGPU(image_keys=OBS_KEYS)
+        batch = {k: torch.randn(8, C, H, W, device="cuda") for k in OBS_KEYS}
+        out = t(batch)
+        for key in OBS_KEYS:
+            assert out[key].is_contiguous(memory_format=torch.channels_last)

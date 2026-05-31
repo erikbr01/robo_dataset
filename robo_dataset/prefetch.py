@@ -35,6 +35,7 @@ DataLoader and convert on-device after transfer.
 
 import queue
 import threading
+import warnings
 from typing import Any
 
 import torch
@@ -125,6 +126,14 @@ class DataPrefetcher:
             # mps, hpu, npu, and any future accelerator without a stream API
             self._stream = None
             self.strategy = "thread"
+
+        if self.strategy == "stream" and not getattr(loader, "pin_memory", False):
+            warnings.warn(
+                "DataPrefetcher strategy='stream' requires pin_memory=True on the "
+                "DataLoader for non-blocking H2D transfers to overlap with compute. "
+                "Pass pin_memory=True when constructing your DataLoader.",
+                stacklevel=2,
+            )
 
     def __len__(self) -> int:
         return len(self.loader)

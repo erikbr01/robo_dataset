@@ -258,6 +258,95 @@ class TestConvert:
         np.testing.assert_allclose(orig, copy, atol=1e-5)
 
 
+# ── ShmStore ──────────────────────────────────────────────────────────────────
+
+class TestShmStore:
+    """ShmStore should be equivalent to its source for all keys."""
+
+    def test_episode_ends_match(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        np.testing.assert_array_equal(shm.episode_ends, src.episode_ends)
+
+    def test_keys_match(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        assert set(shm.keys) == set(src.keys)
+
+    def test_frame_shapes_match(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        for key in src.keys:
+            assert shm.frame_shape(key) == src.frame_shape(key)
+
+    def test_frame_dtypes_match(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        for key in src.keys:
+            assert shm.frame_dtype(key) == src.frame_dtype(key)
+
+    def test_action_exact(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        n = int(src.episode_ends[-1])
+        np.testing.assert_array_equal(
+            shm.get_sequence("action", 0, n),
+            src.get_sequence("action", 0, n),
+        )
+
+    def test_images_exact(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        n = int(src.episode_ends[-1])
+        for key in OBS_KEYS:
+            np.testing.assert_array_equal(
+                shm.get_sequence(key, 0, n),
+                src.get_sequence(key, 0, n),
+            )
+
+    def test_key_subset(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        subset = [OBS_KEYS[0], "action"]
+        shm = ShmStore.from_store(src, keys=subset, verbose=False)
+        assert set(shm.keys) == set(subset)
+
+    def test_on_worker_init_is_noop(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        shm.on_worker_init(0)  # must not raise
+
+    def test_dataloader_multiworker(self, zarr_store_path):
+        """Workers forked from ShmStore can read data zero-copy via shared memory."""
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        from robo_dataset.dataset import TrajectoryDataset
+
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+
+        dataset = TrajectoryDataset(shm, horizon=4, pad_before=1, pad_after=1)
+        loader = dataset.make_dataloader(batch_size=4, num_workers=2, shuffle=False)
+        batch = next(iter(loader))
+        assert batch[OBS_KEYS[0]].shape == (4, 4, H, W, C)
+        assert batch["action"].shape == (4, 4, ACTION_DIM)
+
+
 # ── apply_disk_cached with RLDS writer ────────────────────────────────────────
 
 class TestDiskCacheRLDSWriter:

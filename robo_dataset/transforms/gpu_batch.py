@@ -146,6 +146,38 @@ class ColorJitter(GPUBatchTransform):
         return out
 
 
+class ChannelsLastGPU(GPUBatchTransform):
+    """Convert 4-D image tensors to ``torch.channels_last`` memory format.
+
+    Ampere (and newer) NVIDIA GPUs run conv2d 10–30% faster on NHWC tensors.
+    This transform should be the **last** GPU transform before the model forward
+    so that the layout is locked-in as late as possible (other transforms may
+    call ``.contiguous()`` which reverts the format).
+
+    **Only applies to 4-D tensors** ``(N, C, H, W)``.  Batches of sequences
+    ``(B, T, C, H, W)`` are passed through unchanged because
+    ``contiguous(channels_last)`` is undefined for 5-D inputs.
+
+    Args:
+        image_keys: Keys to convert.  Keys absent from the batch or with
+                    non-4-D tensors are silently skipped.
+    """
+
+    def __init__(self, image_keys: List[str]):
+        self.image_keys = set(image_keys)
+
+    @torch.no_grad()
+    def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(batch)
+        for key in self.image_keys:
+            if key not in batch:
+                continue
+            x = batch[key]
+            if x.ndim == 4:  # (N, C, H, W) only — 5-D is not supported
+                out[key] = x.contiguous(memory_format=torch.channels_last)
+        return out
+
+
 class ComposeGPU(GPUBatchTransform):
     """Apply a sequence of GPUBatchTransforms in order."""
 

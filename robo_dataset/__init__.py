@@ -13,6 +13,7 @@ from .backends import (
     ZarrStoreWriter,
     RLDSFrameStore,
     RLDSFrameStoreWriter,
+    ShmStore,
 )
 from .sampler import SequenceSampler, get_val_mask
 from .convert import convert, convert_rlds
@@ -25,6 +26,7 @@ __all__ = [
     "ZarrStoreWriter",
     "RLDSFrameStore",
     "RLDSFrameStoreWriter",
+    "ShmStore",
     "SequenceSampler",
     "get_val_mask",
     "convert",

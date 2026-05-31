@@ -37,7 +37,7 @@ def __getattr__(name):
     if name == "TrajectoryDataset":
         from .dataset import TrajectoryDataset
         return TrajectoryDataset
-    if name == "CUDADataPrefetcher":
-        from .prefetch import CUDADataPrefetcher
-        return CUDADataPrefetcher
+    if name in ("DataPrefetcher", "CUDADataPrefetcher"):
+        from .prefetch import DataPrefetcher
+        return DataPrefetcher
     raise AttributeError(f"module 'robo_dataset' has no attribute {name!r}")

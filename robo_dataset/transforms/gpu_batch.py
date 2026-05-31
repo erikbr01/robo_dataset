@@ -12,20 +12,22 @@ import torch.nn.functional as F
 from .base import GPUBatchTransform
 
 
-class ImageToTensorGPU(GPUBatchTransform):
-    """Convert uint8 images to float32 on GPU: (B, T, H, W, C) → (B, T, C, H, W) / 255.
+class ImageToTensorDevice(GPUBatchTransform):
+    """Convert uint8 images to float32 on any accelerator: (B,T,H,W,C) → (B,T,C,H,W)/255.
 
-    **Use this instead of ImageToTensor (CPU) when using CUDADataPrefetcher.**
-    Keeping images as uint8 through the DataLoader reduces PCIe transfer by 3.8×
-    (1.35 MB vs 5.42 MB per batch of 32 at 84×84, measured at ~13 GB/s on PCIe 3.0).
-    The uint8→float32 conversion then happens on-GPU at memory bandwidth, not PCIe speed.
+    **Use this instead of** ``ImageToTensor`` **(CPU) when using** ``DataPrefetcher``.
+    Keeping images as uint8 through the DataLoader reduces PCIe/interconnect transfer
+    by 3.8× (1.35 MB vs 5.42 MB per batch of 32 at 84×84 on PCIe 3.0 x16).
+    The dtype conversion then happens at on-device memory bandwidth.
 
-    Note: ``permute().float()`` produces a non-contiguous tensor (strides reflect the
-    original HWC layout). ``.contiguous()`` is called explicitly before the in-place
-    ``div_()`` to avoid downstream issues with ops that require contiguous input.
+    Works on CUDA, MPS, XPU, and CPU — wherever the tensor lives after transfer.
+
+    Note: ``permute().float()`` produces a non-contiguous tensor (the strides still
+    reflect the original HWC layout).  ``.contiguous()`` is called before the in-place
+    ``div_()`` to avoid downstream ops that require contiguous input.
 
     Args:
-        image_keys: Keys to convert. Keys absent from the batch are silently skipped.
+        image_keys: Keys to convert.  Keys absent from the batch are silently skipped.
     """
 
     def __init__(self, image_keys: List[str]):
@@ -37,14 +39,18 @@ class ImageToTensorGPU(GPUBatchTransform):
         for key in self.image_keys:
             if key not in batch:
                 continue
-            x = batch[key]  # (B, T, H, W, C) uint8 on GPU
+            x = batch[key]  # (B, T, H, W, C) uint8
             assert x.dtype == torch.uint8, (
-                f"ImageToTensorGPU expects uint8 input for key '{key}', got {x.dtype}. "
-                "Make sure ImageToTensor is NOT in the CPU compose when using ImageToTensorGPU."
+                f"ImageToTensorDevice expects uint8 input for '{key}', got {x.dtype}. "
+                "Make sure ImageToTensor is NOT in the CPU compose when using ImageToTensorDevice."
             )
             # permute() is non-contiguous; .contiguous() required before in-place div_
             out[key] = x.permute(0, 1, 4, 2, 3).float().contiguous().div_(255.0)
         return out
+
+
+#: Backward-compatible alias.  New code should use :class:`ImageToTensorDevice`.
+ImageToTensorGPU = ImageToTensorDevice
 
 
 class RandomCrop(GPUBatchTransform):

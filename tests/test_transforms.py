@@ -178,3 +178,125 @@ class TestGPUBatchTransform:
         out = jitter(batch)
         assert out[OBS_KEYS[0]].min() >= 0.0
         assert out[OBS_KEYS[0]].max() <= 1.0 + 1e-5
+
+
+# ── ImageToTensorGPU ──────────────────────────────────────────────────────────
+
+def _uint8_batch(B=4, T=2):
+    """Batch with uint8 images in HWC layout, as would arrive from DataLoader."""
+    batch = {}
+    for key in OBS_KEYS:
+        batch[key] = torch.randint(0, 256, (B, T, H, W, C), dtype=torch.uint8)
+    batch[LOWDIM_KEY] = torch.randn(B, T, 3)
+    batch["action"] = torch.randn(B, T, ACTION_DIM)
+    return batch
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestImageToTensorGPU:
+    def test_shape_and_dtype(self):
+        from robo_dataset.transforms.gpu_batch import ImageToTensorGPU
+        t = ImageToTensorGPU(image_keys=OBS_KEYS)
+        batch = {k: v.cuda() for k, v in _uint8_batch().items()}
+        out = t(batch)
+        assert out[OBS_KEYS[0]].shape == (4, 2, C, H, W)
+        assert out[OBS_KEYS[0]].dtype == torch.float32
+
+    def test_range(self):
+        from robo_dataset.transforms.gpu_batch import ImageToTensorGPU
+        t = ImageToTensorGPU(image_keys=OBS_KEYS)
+        batch = {k: v.cuda() for k, v in _uint8_batch().items()}
+        out = t(batch)
+        assert out[OBS_KEYS[0]].min() >= 0.0
+        assert out[OBS_KEYS[0]].max() <= 1.0 + 1e-6
+
+    def test_contiguous_output(self):
+        from robo_dataset.transforms.gpu_batch import ImageToTensorGPU
+        t = ImageToTensorGPU(image_keys=OBS_KEYS)
+        batch = {k: v.cuda() for k, v in _uint8_batch().items()}
+        out = t(batch)
+        assert out[OBS_KEYS[0]].is_contiguous()
+
+    def test_non_image_keys_unchanged(self):
+        from robo_dataset.transforms.gpu_batch import ImageToTensorGPU
+        t = ImageToTensorGPU(image_keys=OBS_KEYS)
+        batch = {k: v.cuda() for k, v in _uint8_batch().items()}
+        out = t(batch)
+        assert out[LOWDIM_KEY] is batch[LOWDIM_KEY]
+        assert out["action"] is batch["action"]
+
+    def test_wrong_dtype_raises(self):
+        from robo_dataset.transforms.gpu_batch import ImageToTensorGPU
+        t = ImageToTensorGPU(image_keys=OBS_KEYS)
+        batch = _uint8_batch()
+        # Pass float32 instead of uint8 — should raise
+        batch[OBS_KEYS[0]] = batch[OBS_KEYS[0]].float().cuda()
+        with pytest.raises(AssertionError):
+            t(batch)
+
+    def test_missing_key_skipped(self):
+        from robo_dataset.transforms.gpu_batch import ImageToTensorGPU
+        t = ImageToTensorGPU(image_keys=["nonexistent"] + OBS_KEYS)
+        batch = {k: v.cuda() for k, v in _uint8_batch().items()}
+        out = t(batch)  # should not raise
+        assert out[OBS_KEYS[0]].dtype == torch.float32
+
+
+# ── CUDADataPrefetcher ────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestCUDADataPrefetcher:
+    def _make_loader(self, n=20, batch_size=4):
+        """Minimal DataLoader returning dict batches of uint8 images."""
+        tensors = {
+            OBS_KEYS[0]: torch.randint(0, 256, (n, H, W, C), dtype=torch.uint8),
+            "action": torch.randn(n, ACTION_DIM),
+        }
+        dataset = torch.utils.data.TensorDataset(
+            tensors[OBS_KEYS[0]], tensors["action"]
+        )
+
+        def collate(batch):
+            imgs, acts = zip(*batch)
+            return {OBS_KEYS[0]: torch.stack(imgs), "action": torch.stack(acts)}
+
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=collate,
+            pin_memory=True,
+            num_workers=0,
+        )
+
+    def test_yields_all_batches(self):
+        from robo_dataset.prefetch import CUDADataPrefetcher
+        loader = self._make_loader(n=20, batch_size=4)
+        prefetcher = CUDADataPrefetcher(loader, device="cuda:0")
+        batches = list(prefetcher)
+        assert len(batches) == len(loader)
+
+    def test_tensors_on_cuda(self):
+        from robo_dataset.prefetch import CUDADataPrefetcher
+        loader = self._make_loader(n=8, batch_size=4)
+        prefetcher = CUDADataPrefetcher(loader, device="cuda:0")
+        for batch in prefetcher:
+            assert batch[OBS_KEYS[0]].device.type == "cuda"
+            assert batch["action"].device.type == "cuda"
+
+    def test_len(self):
+        from robo_dataset.prefetch import CUDADataPrefetcher
+        loader = self._make_loader(n=20, batch_size=4)
+        prefetcher = CUDADataPrefetcher(loader, device="cuda:0")
+        assert len(prefetcher) == len(loader)
+
+    def test_non_cuda_raises(self):
+        from robo_dataset.prefetch import CUDADataPrefetcher
+        loader = self._make_loader()
+        with pytest.raises(ValueError, match="CUDA"):
+            CUDADataPrefetcher(loader, device="cpu")
+
+    def test_empty_loader(self):
+        from robo_dataset.prefetch import CUDADataPrefetcher
+        loader = self._make_loader(n=0, batch_size=4)
+        prefetcher = CUDADataPrefetcher(loader, device="cuda:0")
+        assert list(prefetcher) == []

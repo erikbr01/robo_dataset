@@ -22,6 +22,19 @@ uv pip install -e ".[dev]"
 | Robomimic HDF5 | `RobomimicHDF5Store` | ✓ | – | Source format |
 | zarr DirectoryStore | `ZarrStore` / `ZarrStoreWriter` | ✓ | ✓ | zarr v2/v3 compatible |
 | RLDS/TFRecord | `RLDSFrameStore` / `RLDSFrameStoreWriter` | ✓ | ✓ | One record per frame, random access via index |
+| Shared-memory RAM | `ShmStore` | ✓ | – | Zero-copy after one-time load; fork-safe |
+
+### Which backend to use
+
+```
+Dataset fits in RAM? (rule of thumb: < ½ of system RAM)
+├── Yes  →  ShmStore (load once from zarr/HDF5; 35k fps, no disk I/O after load)
+└── No   →  RLDSFrameStore (32k fps at 12 workers, 15× compressed, single TFRecord file)
+             └── Already have zarr and don't want to reconvert?
+                 └── ZarrStore (6–25k fps depending on worker count)
+```
+
+`ShmStore` is fastest for datasets that fit in RAM (typical robotics datasets at 84×84 are 200 MB – 5 GB uncompressed). `RLDSFrameStore` is the right default for larger datasets — it eliminates the per-frame `open()` syscall bottleneck that limits zarr at high worker counts.
 
 ## Convert HDF5 → zarr
 
@@ -38,6 +51,20 @@ dst = ZarrStoreWriter.create(
     image_keys=["agentview_image", "robot0_eye_in_hand_image"],
 )
 convert(src, dst)  # streams one episode at a time
+```
+
+## Load zarr into shared memory (ShmStore)
+
+```python
+from robo_dataset.backends.zarr_backend import ZarrStore
+from robo_dataset.backends.shm import ShmStore
+
+zarr_store = ZarrStore("output.zarr")
+store = ShmStore.from_store(zarr_store)  # one-time load, ~4s for 9k frames
+
+# Use store in TrajectoryDataset — workers read zero-copy from shared memory
+dataset = TrajectoryDataset(store, horizon=16, pad_before=1, pad_after=7)
+loader = dataset.make_dataloader(batch_size=32, num_workers=8)
 ```
 
 ## Convert HDF5 → RLDS/TFRecord
@@ -95,22 +122,39 @@ conda run -n robocasa python -m pytest tests/ -q
 
 ## Benchmarks
 
-Storage format benchmarks are in `tools/`:
+Benchmarks are in `tools/`:
 
 - `tools/benchmark_storage.py` — zarr, HDF5 formats (run in `rerun_env`)
 - `tools/benchmark_rlds.py` — RLDS/TFRecord format (run in `rerun_env`)
 - `tools/benchmark_rrd.py` — Rerun RRD format (run in `rerun_env`)
 - `tools/benchmark_lerobot.py` — video formats via torchcodec (run in `robocasa`)
+- `tools/benchmark_acceleration.py` — ShmStore vs zarr_disk + channels_last conv (run in `robocasa`)
 - `tools/make_pareto_plot.py` — generate throughput vs size scatter plot
 
-### Key results (Robomimic Lift PH, 12 DataLoader workers)
+### Storage format (Robomimic Lift PH, 12 DataLoader workers)
 
 | Format | Size | vs raw | fps |
 |---|---|---|---|
 | **rlds_frame_jpeg_q75** | 27.6 MB | 14.8× | **31.6k** |
+| zarr_disk_lz4 | 223 MB | 1.8× | 24.9k |
 | zarr_disk_jpeg_q75 | 26.6 MB | 15.4× | 19.9k |
 | h264_kf1 + cached decoder | 10 MB | 41× | 16.4k |
-| zarr_disk_lz4 | 223 MB | 1.8× | 24.9k |
 
-RLDS/TFRecord is the **Pareto-optimal** training format: smallest size AND fastest throughput.
-Why: zarr uses one file per frame (19k `open()` syscalls per epoch), TFRecord uses one file total.
+`rlds_frame_jpeg_q75` is Pareto-optimal: smallest size AND fastest throughput.
+Root cause of zarr's bottleneck: one file per chunk → 19k `open()` syscalls per epoch per worker.
+
+### ShmStore vs zarr_disk (Robomimic Lift PH, RTX 4090)
+
+| workers | zarr_disk_lz4 | ShmStore | speedup |
+|--------:|--------------|----------|---------|
+| 0 | 706 fps | 35,910 fps | 50.9× |
+| 4 | 2,771 fps | 27,127 fps | 9.8× |
+| 8 | 4,945 fps | 25,844 fps | 5.2× |
+| 12 | 6,500 fps | 24,960 fps | 3.8× |
+
+ShmStore initial load: ~4s for 9,666 frames (409 MB). Workers read zero-copy via shared memory pages.
+Note: ShmStore throughput *decreases* with more workers because workers add IPC/fork overhead even though memory is shared; at 0 workers the main thread slices tensors directly.
+
+### channels_last conv2d (RTX 4090, batch=32, 84×84)
+
+1.01× — negligible on Ada Lovelace at robotics scale. The 10–30% gains reported in the literature are Ampere-era measurements with larger batches and deeper networks.

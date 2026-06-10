@@ -180,6 +180,10 @@ conda run -n robocasa python -m pytest tests/ -q
 
 ## Benchmarks
 
+![Storage benchmark Pareto plot](media/storage_benchmark_pareto.png)
+
+Left panel: raw per-frame throughput (horizon=1). Right panel: training throughput (horizon=8) — the scenario this library targets. Gold outline = Pareto-optimal. `make_pareto_plot.py` regenerates this from benchmark JSON files.
+
 Benchmarks are in `tools/`:
 
 - `tools/benchmark_storage.py` — zarr, HDF5 formats (run in `rerun_env`)

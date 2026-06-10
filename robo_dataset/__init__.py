@@ -11,10 +11,6 @@ from .backends import (
     RobomimicHDF5Store,
     ZarrStore,
     ZarrStoreWriter,
-    ZarrShardedStore,
-    ZarrShardedStoreWriter,
-    RLDSFrameStore,
-    RLDSFrameStoreWriter,
     ShmStore,
     VideoStore,
     VideoStoreWriter,
@@ -50,4 +46,8 @@ def __getattr__(name):
     if name in ("DataPrefetcher", "CUDADataPrefetcher"):
         from .prefetch import DataPrefetcher
         return DataPrefetcher
+    if name in ("ZarrShardedStore", "ZarrShardedStoreWriter",
+                "RLDSFrameStore", "RLDSFrameStoreWriter"):
+        from . import backends
+        return getattr(backends, name)
     raise AttributeError(f"module 'robo_dataset' has no attribute {name!r}")

@@ -12,6 +12,24 @@ import pytest
 from .constants import N_EPISODES, EP_LENGTHS, OBS_KEYS, LOWDIM_KEY, H, W, C, ACTION_DIM
 
 
+def _has_module(name: str) -> bool:
+    import importlib.util
+    return importlib.util.find_spec(name) is not None
+
+
+def _has_zarr3() -> bool:
+    import zarr
+    return int(zarr.__version__.split(".")[0]) >= 3
+
+
+requires_rlds = pytest.mark.skipif(
+    not _has_module("tfrecord"), reason="tfrecord not installed (RLDS backend)"
+)
+requires_zarr3 = pytest.mark.skipif(
+    not _has_zarr3(), reason="zarr >= 3.0 required (ShardingCodec backend)"
+)
+
+
 def _psnr(a: np.ndarray, b: np.ndarray) -> float:
     mse = np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)
     if mse == 0:
@@ -111,6 +129,7 @@ class TestZarrEquivalence:
 
 # ── RLDS store equivalence ────────────────────────────────────────────────────
 
+@requires_rlds
 class TestRLDSEquivalence:
     def test_episode_metadata(self, synthetic_hdf5, rlds_store_path):
         from robo_dataset.backends.hdf5 import RobomimicHDF5Store
@@ -155,6 +174,7 @@ class TestDataLoader:
         assert batch[OBS_KEYS[0]].shape == (4, 4, H, W, C)
         assert batch["action"].shape == (4, 4, ACTION_DIM)
 
+    @requires_rlds
     def test_rlds_dataloader(self, rlds_store_path):
         from robo_dataset.backends.rlds import RLDSFrameStore
         from robo_dataset.dataset import TrajectoryDataset
@@ -239,6 +259,7 @@ class TestConvert:
         copy = dst.get_sequence("action", 0, dst.n_frames)
         np.testing.assert_array_equal(orig, copy)
 
+    @requires_rlds
     def test_convert_rlds_from_zarr(self, zarr_store_path, tmp_path):
         """convert_rlds() works with a zarr source (non-HDF5 input path)."""
         from robo_dataset.backends.zarr_backend import ZarrStore
@@ -349,6 +370,7 @@ class TestShmStore:
 
 # ── ZarrShardedStore equivalence ─────────────────────────────────────────────
 
+@requires_zarr3
 class TestZarrShardedEquivalence:
     """Sharded zarr-v3 store must return the same data as HDF5 (bit-exact for lz4)."""
 
@@ -435,6 +457,7 @@ class TestZarrShardedEquivalence:
 
 # ── apply_disk_cached with RLDS writer ────────────────────────────────────────
 
+@requires_rlds
 class TestDiskCacheRLDSWriter:
     def test_rlds_as_cache_writer(self, synthetic_hdf5, tmp_path):
         """apply_disk_cached() produces a valid RLDS store when writer_cls=RLDSFrameStoreWriter."""

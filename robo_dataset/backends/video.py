@@ -34,6 +34,101 @@ _DEFAULT_MAX_DECODERS = 32
 _NON_VIDEO_CHUNK_FRAMES = 512  # frames per zarr chunk for action/lowdim keys
 
 
+# ── Decoder compatibility layer ───────────────────────────────────────────────
+#
+# Three decode paths, picked once per process at first use:
+#   "modern"  torchcodec >= 0.1   VideoDecoder.get_frames_at(indices=[...])
+#   "legacy"  torchcodec 0.0.3    SimpleVideoDecoder.get_frames_at(start, stop)
+#                                 (contiguous ranges only — which is all
+#                                  VideoStore ever requests per episode)
+#   "pyav"    no torchcodec       PyAV sequential decode (slowest; correct)
+
+_DECODER_BACKEND: Optional[str] = None
+
+
+def _pick_decoder_backend() -> str:
+    global _DECODER_BACKEND
+    if _DECODER_BACKEND is not None:
+        return _DECODER_BACKEND
+    try:
+        from torchcodec.decoders import VideoDecoder  # noqa: F401
+        _DECODER_BACKEND = "modern"
+    except Exception:
+        try:
+            from torchcodec.decoders import SimpleVideoDecoder  # noqa: F401
+            _DECODER_BACKEND = "legacy"
+        except Exception:
+            import av  # noqa: F401  (raise here if neither stack is present)
+            _DECODER_BACKEND = "pyav"
+    return _DECODER_BACKEND
+
+
+class _ModernDecoder:
+    """torchcodec >= 0.1: VideoDecoder with arbitrary-index batch API."""
+
+    def __init__(self, path: str):
+        from torchcodec.decoders import VideoDecoder
+        self._dec = VideoDecoder(path, device="cpu", seek_mode="approximate")
+
+    def get_frames(self, indices: List[int]) -> np.ndarray:
+        result = self._dec.get_frames_at(indices=indices)
+        return result.data.permute(0, 2, 3, 1).numpy()
+
+
+class _LegacyDecoder:
+    """torchcodec 0.0.3: SimpleVideoDecoder with range-based batch API."""
+
+    def __init__(self, path: str):
+        from torchcodec.decoders import SimpleVideoDecoder
+        self._dec = SimpleVideoDecoder(path)
+
+    def get_frames(self, indices: List[int]) -> np.ndarray:
+        contiguous = len(indices) <= 1 or all(
+            b - a == 1 for a, b in zip(indices[:-1], indices[1:])
+        )
+        if contiguous:
+            batch = self._dec.get_frames_at(indices[0], indices[-1] + 1)
+            return batch.data.permute(0, 2, 3, 1).numpy()
+        frames = [self._dec.get_frame_at(i).data for i in indices]
+        import torch
+        return torch.stack(frames).permute(0, 2, 3, 1).numpy()
+
+
+class _PyAVDecoder:
+    """PyAV fallback: sequential decode of the requested range.
+
+    With kfi=1 every frame is a keyframe, so seeking is exact; with larger
+    kfi PyAV seeks to the previous keyframe and decodes forward.
+    """
+
+    def __init__(self, path: str):
+        import av
+        self._av = av
+        self._path = path
+        self._container = av.open(path)
+        self._stream = self._container.streams.video[0]
+
+    def get_frames(self, indices: List[int]) -> np.ndarray:
+        # Decode sequentially from the nearest keyframe at/before indices[0].
+        want = set(indices)
+        first, last = min(indices), max(indices)
+        stream = self._stream
+        # Seek to the frame's timestamp (backward=True lands on a keyframe ≤ target).
+        ts_per_frame = int(round(1 / (stream.average_rate * stream.time_base)))
+        self._container.seek(first * ts_per_frame, stream=stream, backward=True)
+        got = {}
+        for frame in self._container.decode(stream):
+            idx = int(round(frame.pts / ts_per_frame))
+            if idx in want:
+                got[idx] = frame.to_ndarray(format="rgb24")
+            if idx >= last:
+                break
+        return np.stack([got[i] for i in indices])
+
+
+_DECODER_CLS = {"modern": _ModernDecoder, "legacy": _LegacyDecoder, "pyav": _PyAVDecoder}
+
+
 class _LRUDecoderCache:
     def __init__(self, maxsize: int = _DEFAULT_MAX_DECODERS):
         self._cache: OrderedDict = OrderedDict()
@@ -117,22 +212,19 @@ class VideoStore(TrajectoryStore):
         return np.dtype(self._dtypes[key])
 
     def _get_decoder(self, key: str, ep_idx: int):
-        from torchcodec.decoders import VideoDecoder
         cache_key = (key, ep_idx)
         dec = self._decoder_cache.get(cache_key)
         if dec is None:
             mp4_path = os.path.join(
                 self.path, "videos", key, f"episode_{ep_idx:06d}.mp4"
             )
-            dec = VideoDecoder(mp4_path, device="cpu", seek_mode="approximate")
+            dec = _DECODER_CLS[_pick_decoder_backend()](mp4_path)
             self._decoder_cache.put(cache_key, dec)
         return dec
 
     def _decode_frames(self, key: str, ep_idx: int, local_indices: List[int]) -> np.ndarray:
-        dec = self._get_decoder(key, ep_idx)
-        result = dec.get_frames_at(indices=local_indices)
-        # result.data: (N, C, H, W) uint8 → (N, H, W, C) uint8
-        return result.data.permute(0, 2, 3, 1).numpy()
+        # (N, H, W, C) uint8
+        return self._get_decoder(key, ep_idx).get_frames(local_indices)
 
     def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
         if key not in self._video_keys:

@@ -34,6 +34,8 @@ class TrajectoryDataset(Dataset):
         keys: Optional[List[str]] = None,
         key_first_k: Optional[Dict[str, int]] = None,
         episode_mask: Optional[np.ndarray] = None,
+        sample_mask: Optional[np.ndarray] = None,
+        sample_mask_drop_threshold: float = 1.0,
         val_ratio: float = 0.0,
         seed: int = 42,
     ):
@@ -56,6 +58,8 @@ class TrajectoryDataset(Dataset):
             keys=keys,
             key_first_k=key_first_k,
             episode_mask=self._episode_mask,
+            sample_mask=sample_mask,
+            sample_mask_drop_threshold=sample_mask_drop_threshold,
         )
 
     def get_validation_dataset(self) -> "TrajectoryDataset":

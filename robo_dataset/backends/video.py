@@ -31,6 +31,7 @@ _DEFAULT_CRF = 23
 _DEFAULT_KFI = 1
 _DEFAULT_FPS = 10
 _DEFAULT_MAX_DECODERS = 32
+_AUTO_MAX_DECODER_CACHE = 1024  # cap for the auto-sized per-worker decoder cache
 _NON_VIDEO_CHUNK_FRAMES = 512  # frames per zarr chunk for action/lowdim keys
 
 
@@ -161,10 +162,16 @@ class VideoStore(TrajectoryStore):
     are stored as zarr lz4 arrays.  Uses torchcodec VideoDecoder with
     seek_mode='approximate' and a bounded LRU decoder cache per worker.
 
+    max_decoders sizes the per-worker LRU decoder cache. The default (None)
+    auto-sizes to n_episodes × n_video_keys (capped at 1024) — under uniform
+    random sampling a cache smaller than the working set thrashes: every
+    sample re-opens a decoder, costing ~3× throughput on small-image
+    datasets. Pass an explicit value to bound memory on huge datasets.
+
     Requires torchcodec and torch (for decoding) and zarr (for non-video keys).
     """
 
-    def __init__(self, path: str, max_decoders: int = _DEFAULT_MAX_DECODERS):
+    def __init__(self, path: str, max_decoders: Optional[int] = None):
         self.path = path
         with open(os.path.join(path, _META_FILE)) as f:
             meta = json.load(f)
@@ -176,6 +183,9 @@ class VideoStore(TrajectoryStore):
         self._fps: float = float(meta.get("fps", _DEFAULT_FPS))
         self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
 
+        if max_decoders is None:
+            working_set = max(1, len(self._episode_ends) * max(1, len(self._video_keys)))
+            max_decoders = min(working_set, _AUTO_MAX_DECODER_CACHE)
         self._max_decoders = max_decoders
         self._decoder_cache = _LRUDecoderCache(maxsize=max_decoders)
 

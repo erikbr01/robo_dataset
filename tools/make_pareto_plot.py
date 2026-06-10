@@ -3,8 +3,6 @@
 Two panels:
   Left  — horizon=1 raw-frame benchmark (existing storage/lerobot/rlds/rrd data)
   Right — horizon=8 training-scenario benchmark (acceleration benchmark data)
-
-Key findings annotated directly on the plot.
 """
 import json
 import pathlib
@@ -12,7 +10,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
-import matplotlib.patches as mpatches
 import matplotlib.ticker
 import numpy as np
 
@@ -36,7 +33,6 @@ rrd_by_label  = {r['label']: r for r in rrd['results']}
 lero_by_label = {r['label']: r for r in lero['results']}
 rlds_by_label = {r['label']: r for r in rlds['results'] if r['label'] != 'zarr_disk_jpeg_q75'}
 accel_fps12   = accel['dataloader_fps']['12']
-accel_fps8    = accel['dataloader_fps']['8']   # for RLDS scaling note
 
 
 def _dir_size_mb(path):
@@ -46,10 +42,6 @@ def _dir_size_mb(path):
 # ── Styling ────────────────────────────────────────────────────────────────
 BG = '#0F1117'
 FG = '#E0E0E0'
-ANNOT_KW = dict(fontsize=7.5, color='#AAAAAA',
-                path_effects=[pe.withStroke(linewidth=2, foreground=BG)])
-FINDING_KW = dict(fontsize=7.5, color='#FFD700',
-                  path_effects=[pe.withStroke(linewidth=2, foreground=BG)])
 
 CATS = {
     'rlds':           dict(color='#FF6B6B', marker='*',  label='RLDS/TFRecord'),
@@ -62,6 +54,7 @@ CATS = {
     'video_official': dict(color='#EF9A9A', marker='X',  label='video + official decoder'),
     'video_store':    dict(color='#FF8A65', marker='h',  label='VideoStore (robo_dataset)'),
     'robodm':         dict(color='#A5D6A7', marker='v',  label='RoboDM episode cache'),
+    'shm':            dict(color='#FFD700', marker='^',  label='ShmStore (RAM, zero-copy)'),
 }
 
 
@@ -144,8 +137,6 @@ def _draw_panel(ax, entries, title, raw_mb=None):
     ax.legend(loc='lower right', fontsize=7.5, framealpha=0.3,
               facecolor='#1A1A2E', edgecolor='#444', labelcolor=FG, markerscale=1.1)
 
-    return pareto_idx
-
 
 # ── Panel A entries ────────────────────────────────────────────────────────
 entries_h1 = [
@@ -185,28 +176,36 @@ entries_h1 = [
 # ── Panel B entries ────────────────────────────────────────────────────────
 BENCH_ROOT = '/mnt/ssdB/erik/cupid_data/robo_dataset_bench'
 
-_vs_mb   = _dir_size_mb(f'{BENCH_ROOT}/videostore_mb')   if pathlib.Path(f'{BENCH_ROOT}/videostore_mb').exists() else _dir_size_mb(f'{BENCH_ROOT}/h264_kf1_crf23')
-_vs_fps  = accel_fps12['h264_kf1_crf23']
-_rlds_mb = _dir_size_mb(f'{BENCH_ROOT}/rlds_jpeg_q75')
-_rlds_fps12 = accel_fps12['rlds_jpeg_q75']
-_rlds_fps8  = accel_fps8['rlds_jpeg_q75']
+_vs_mb  = _dir_size_mb(f'{BENCH_ROOT}/h264_kf1_crf23')
+_vs_fps = accel_fps12.get('h264_kf1_crf23', 0)
+
+_rlds_mb  = _dir_size_mb(f'{BENCH_ROOT}/rlds_jpeg_q75')
+_rlds_fps = accel_fps12.get('rlds_jpeg_q75', 0)
+
 _shard_mb  = _dir_size_mb(f'{BENCH_ROOT}/zarr_sharded_cf8')
-_shard_fps = accel_fps12['zarr_sharded_lz4']
+_shard_fps = accel_fps12.get('zarr_sharded_lz4', 0)
+
 _sjpeg_mb  = _dir_size_mb(f'{BENCH_ROOT}/zarr_sharded_jpeg_q75')
-_sjpeg_fps = accel_fps12['zarr_sharded_jpeg']
+_sjpeg_fps = accel_fps12.get('zarr_sharded_jpeg', 0)
+
 _zdisk_mb  = _dir_size_mb(f'{BENCH_ROOT}/zarr_disk_lz4')
-_zdisk_fps = accel_fps12['zarr_disk_lz4']
+_zdisk_fps = accel_fps12.get('zarr_disk_lz4', 0)
+
+_shm_fps   = accel_fps12.get('shm_lz4', 0)
 
 entries_h8 = [
-    dict(mb=_zdisk_mb,  fps=_zdisk_fps,  cat='zarr_lossless'),
-    dict(mb=_shard_mb,  fps=_shard_fps,  cat='zarr_sharded',
+    dict(mb=_zdisk_mb,  fps=_zdisk_fps, cat='zarr_lossless'),
+    dict(mb=_shard_mb,  fps=_shard_fps, cat='zarr_sharded',
          label='zarr sharded\nlz4  cf=8', lbl_offset=(5, 8)),
-    dict(mb=_sjpeg_mb,  fps=_sjpeg_fps,  cat='zarr_sharded'),
-    dict(mb=_rlds_mb,   fps=_rlds_fps12, cat='rlds',
+    dict(mb=_sjpeg_mb,  fps=_sjpeg_fps, cat='zarr_sharded'),
+    dict(mb=_rlds_mb,   fps=_rlds_fps,  cat='rlds',
          label='RLDS\njpeg q75', lbl_offset=(-75, 8)),
-    dict(mb=_vs_mb,     fps=_vs_fps,     cat='video_store',
+    dict(mb=_vs_mb,     fps=_vs_fps,    cat='video_store',
          label='VideoStore\nH.264 kf1', lbl_offset=(5, 8)),
 ]
+if _shm_fps > 0:
+    entries_h8.append(dict(mb=_zdisk_mb, fps=_shm_fps, cat='shm',
+                           label='ShmStore\n(RAM)', lbl_offset=(5, -18)))
 
 # ── Build figure ────────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
@@ -222,90 +221,12 @@ _draw_panel(
     raw_mb=409,
 )
 
-# annotation on left panel: RLDS single-file caveat
-rlds_h1_fps = fps12(rlds_by_label['rlds_frame_jpeg_q75']) / 1000
-rlds_h1_mb  = rlds_by_label['rlds_frame_jpeg_q75']['size_mb']
-ax1.annotate(
-    'single-file design:\nscales poorly >8 workers\n(see horizon=8 panel →)',
-    xy=(rlds_h1_mb, rlds_h1_fps),
-    xytext=(-130, -55), textcoords='offset points',
-    fontsize=7, color='#FF9999', ha='left',
-    arrowprops=dict(arrowstyle='->', color='#FF9999', lw=0.8),
-    path_effects=[pe.withStroke(linewidth=2, foreground=BG)],
-)
-
 _draw_panel(
     ax2, entries_h8,
     'Training throughput  (horizon=8)\n'
     'Robomimic Lift PH · 9666 frames × 2 cams · 84×84×3 · 12 workers\n'
     'Gold outline = Pareto-optimal',
     raw_mb=409,
-)
-
-# ── Right-panel findings annotations ──────────────────────────────────────
-
-# 1. ZarrSharded lz4 dominated by VideoStore
-ax2.annotate(
-    'dominated:\nVideoStore is\nsmaller & faster',
-    xy=(_shard_mb, _shard_fps / 1000),
-    xytext=(15, 25), textcoords='offset points',
-    fontsize=7, color='#888888', ha='left',
-    arrowprops=dict(arrowstyle='->', color='#666666', lw=0.8),
-    path_effects=[pe.withStroke(linewidth=2, foreground=BG)],
-)
-
-# 2. ZarrSharded jpeg dominated by RLDS at same size
-ax2.annotate(
-    'dominated:\nRLDS is 4.6× faster\nat same size',
-    xy=(_sjpeg_mb, _sjpeg_fps / 1000),
-    xytext=(15, -35), textcoords='offset points',
-    fontsize=7, color='#888888', ha='left',
-    arrowprops=dict(arrowstyle='->', color='#666666', lw=0.8),
-    path_effects=[pe.withStroke(linewidth=2, foreground=BG)],
-)
-
-# 3. RLDS multi-worker scaling regression
-_rlds_drop_pct = (_rlds_fps8 - _rlds_fps12) / _rlds_fps8 * 100
-ax2.annotate(
-    f'single-file contention:\npeaks at 8 workers\n({_rlds_fps8/1000:.1f}k → {_rlds_fps12/1000:.1f}k fps,\n−{_rlds_drop_pct:.0f}% at 12 workers)',
-    xy=(_rlds_mb, _rlds_fps12 / 1000),
-    xytext=(-165, 15), textcoords='offset points',
-    fontsize=7, color='#FF9999', ha='left',
-    arrowprops=dict(arrowstyle='->', color='#FF9999', lw=0.8),
-    path_effects=[pe.withStroke(linewidth=2, foreground=BG)],
-)
-
-# 4. zarr disk not competitive
-ax2.annotate(
-    'lz4 barely compresses\nimages (1.4×);\n1-file-per-frame\nopen() overhead',
-    xy=(_zdisk_mb, _zdisk_fps / 1000),
-    xytext=(8, 8), textcoords='offset points',
-    fontsize=7, color='#888888', ha='left',
-    path_effects=[pe.withStroke(linewidth=2, foreground=BG)],
-)
-
-# 5. VideoStore finding box
-_box_txt = (
-    '★  VideoStore is Pareto-optimal:\n'
-    '    smallest (10 MB) AND faster\n'
-    '    than ZarrSharded (4.2k vs 3.9k fps)\n'
-    '\n'
-    '★  Pareto frontier has only 2 points,\n'
-    '    both lossy. No lossless backend\n'
-    '    reaches the frontier at horizon=8.\n'
-    '\n'
-    '★  ZarrSharded lz4 is lossless and\n'
-    '    avoids single-file contention,\n'
-    '    but dominated on size+speed.'
-)
-ax2.text(
-    0.02, 0.97, _box_txt,
-    transform=ax2.transAxes,
-    fontsize=7, color=FG, va='top', ha='left',
-    bbox=dict(boxstyle='round,pad=0.5', facecolor='#1A1A2E',
-              edgecolor='#FFD700', alpha=0.85),
-    path_effects=[pe.withStroke(linewidth=1, foreground=BG)],
-    zorder=10,
 )
 
 fig.suptitle(

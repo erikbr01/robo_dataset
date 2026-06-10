@@ -231,6 +231,7 @@ def benchmark_dataloader(
     worker_counts,
     horizon: int = 8,
     video_path: str = None,
+    use_shm: bool = False,
 ):
     from robo_dataset.backends.zarr_backend import ZarrStore
     from robo_dataset.backends.zarr_sharded import ZarrShardedStore
@@ -265,6 +266,13 @@ def benchmark_dataloader(
         from robo_dataset.backends.video import VideoStore
         video_label = os.path.basename(video_path)
         stores.append((video_label, VideoStore(video_path)))
+
+    if use_shm:
+        from robo_dataset.backends.shm import ShmStore
+        print("Loading zarr_disk into shared memory (one-time cost) …")
+        shm_src = ShmStore.from_store(zarr_src, verbose=True)
+        stores.append(("shm_lz4", shm_src))
+        print("ShmStore ready.")
 
     results = {}
 
@@ -471,6 +479,11 @@ def main():
     )
     ap.add_argument("--video-crf", type=int, default=23, help="CRF for video encoding")
     ap.add_argument("--video-kfi", type=int, default=1, help="Keyframe interval for video encoding")
+    ap.add_argument(
+        "--shm",
+        action="store_true",
+        help="Also benchmark ShmStore (load zarr_disk into shared RAM; zero-copy workers)",
+    )
     args = ap.parse_args()
 
     if args.zarr:
@@ -519,6 +532,7 @@ def main():
         zarr_path, sharded_lz4_path, sharded_jpeg_path, rlds_path,
         args.batch, args.epochs, args.workers, args.horizon,
         video_path=video_path,
+        use_shm=args.shm,
     )
 
     sweep_results = {}
@@ -542,6 +556,7 @@ def main():
             "sharded_jpeg": sharded_jpeg_path,
             "rlds": rlds_path,
             "video": video_path,
+            "shm": args.shm,
             "batch": args.batch,
             "epochs": args.epochs,
             "workers": args.workers,

@@ -18,6 +18,7 @@ _LAZY = {
     "ZarrShardedStoreWriter": "zarr_sharded",
     "RLDSFrameStore": "rlds",
     "RLDSFrameStoreWriter": "rlds",
+    "LeRobotStore": "lerobot",
 }
 
 
@@ -42,4 +43,5 @@ __all__ = [
     "ShmStore",
     "VideoStore",
     "VideoStoreWriter",
+    "LeRobotStore",
 ]

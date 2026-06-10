@@ -33,8 +33,6 @@ class RobomimicHDF5Store(TrajectoryStore):
       separate HDF5 reads, each with its own decompression step.
     - Images are typically stored uncompressed in Robomimic files → large disk footprint.
     - Read-only: no write path (use ZarrStoreWriter or RLDSFrameStoreWriter to convert).
-    - abs_action / rotation_rep parameters create a soft dependency on diffusion_policy
-      for anything other than the default axis_angle representation.
     """
 
     def __init__(
@@ -146,8 +144,7 @@ def _convert_actions(raw: np.ndarray, rotation_rep: str) -> np.ndarray:
     if rotation_rep == "axis_angle":
         return raw
 
-    # Deferred import to avoid hard dependency
-    from diffusion_policy.model.common.rotation_transformer import RotationTransformer
+    from robo_dataset.transforms.rotation_transformer import RotationTransformer
     rt = RotationTransformer(from_rep="axis_angle", to_rep=rotation_rep)
 
     is_dual_arm = raw.shape[-1] == 14

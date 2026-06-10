@@ -19,6 +19,7 @@ _LAZY = {
     "RLDSFrameStore": "rlds",
     "RLDSFrameStoreWriter": "rlds",
     "LeRobotStore": "lerobot",
+    "DroidStore": "droid",
 }
 
 

@@ -210,10 +210,10 @@ Root cause of zarr's bottleneck: one file per chunk → 19k `open()` syscalls pe
 
 | workers | zarr_disk_lz4 | zarr_sharded_lz4 | zarr_sharded_jpeg | rlds_jpeg_q75 | h264_kf1 |
 |--------:|--------------|------------------|-------------------|---------------|----------|
-| 0 | 247 fps | 311 fps | 211 fps | 1,957 fps | 355 fps |
-| 4 | 1,013 fps | 1,629 fps | 798 fps | 5,883 fps | 1,772 fps |
-| 8 | 1,679 fps | 2,786 fps | 1,331 fps | 8,787 fps | 3,076 fps |
-| 12 | 2,217 fps | 3,540 fps | 1,675 fps | **8,303 fps** | 4,082 fps |
+| 0 | 211 fps | 414 fps | 200 fps | 1,911 fps | 510 fps |
+| 4 | 1,038 fps | 1,573 fps | 770 fps | 5,844 fps | 1,777 fps |
+| 8 | 1,708 fps | 2,852 fps | 1,403 fps | 9,157 fps | 3,245 fps |
+| 12 | 2,294 fps | 3,858 fps | 1,812 fps | **8,392 fps** | 4,224 fps |
 
 Storage: zarr_disk 305 MB · sharded_lz4 170 MB · sharded_jpeg 27 MB · rlds 27 MB · **h264_kf1 11 MB**
 

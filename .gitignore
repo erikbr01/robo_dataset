@@ -1,6 +1,53 @@
-*.pyc
+# Python
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
 *.egg-info/
 .eggs/
-*.egg-info/
-__pycache__/
+dist/
+build/
+*.whl
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Hydra outputs
+outputs/
+multirun/
+.hydra/
+
+# Data / checkpoints (large files)
+*.ckpt
+*.pt
+*.pth
+*.hdf5
+*.h5
+*.zarr/
+*.tfrecord
+*.rlds/

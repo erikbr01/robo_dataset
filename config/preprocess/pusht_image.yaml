@@ -1,0 +1,6 @@
+# Preprocess for Push-T image task (single 96×96 RGB camera).
+# Applied to obs dict BEFORE policy.predict_action() — identical at train + inference.
+_target_: robo_dataset.transforms.InferencePipeline
+transforms:
+  - _target_: robo_dataset.transforms.ToFloat
+    keys: [image]

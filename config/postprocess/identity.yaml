@@ -1,0 +1,5 @@
+# No-op postprocess — for tasks with no rotation-rep conversion needed
+# (relative-action robomimic, Push-T, low-dim tasks, etc.).
+_target_: robo_dataset.transforms.InferencePipeline
+transforms:
+  - _target_: robo_dataset.transforms.IdentityAction

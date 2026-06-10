@@ -1,0 +1,12 @@
+# Preprocess for robomimic image tasks (agentview + eye-in-hand, 84×84 RGB).
+# Applied to obs dict BEFORE policy.predict_action() — identical at train + inference.
+# Serialised into the checkpoint; inference only needs the .ckpt file.
+_target_: robo_dataset.transforms.InferencePipeline
+transforms:
+  - _target_: robo_dataset.transforms.NormalizeImages
+    keys:
+      - agentview_image
+      - robot0_eye_in_hand_image
+    mean: [0.485, 0.456, 0.406]   # ImageNet
+    std:  [0.229, 0.224, 0.225]
+    from_uint8: true

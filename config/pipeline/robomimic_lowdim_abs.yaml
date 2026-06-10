@@ -1,0 +1,25 @@
+# Transforms for robomimic low-dim abs-action tasks.
+# Compatible data_sources: lift_lowdim_abs, can_lowdim_abs, square_lowdim_abs,
+#                          tool_hang_lowdim_abs, transport_lowdim_abs
+#
+# Preprocess:  identity — obs is already a float vector, no image normalisation
+# Postprocess: rotation_6d → axis_angle.
+#
+# For single-arm tasks (10-dim → 7-dim):
+#   rotation_fields: [rotation]
+# For bimanual transport (20-dim → 14-dim), replace with:
+#   rotation_fields: [robot0_rotation, robot1_rotation]
+
+preprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.IdentityObs
+
+postprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.ConvertRotation
+      rotation_fields: [rotation]
+      action_fields: ${data_source.action.fields}
+      from_rep: ${data_source.action.rotation_rep}
+      to_rep: ${data_source.action.output_rotation_rep}

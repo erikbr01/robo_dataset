@@ -1,96 +1,208 @@
 # Config architecture
 
-## Data configs (this repo)
+## Directory layout
 
 ```
 config/
-├── datasource/   ← one file per dataset / task / modality variant
+├── data_source/     ← one file per task/modality/action-space variant
 │   ├── lift_image_abs.yaml
-│   ├── pusht_image.yaml
+│   ├── lift_image.yaml
+│   ├── transport_image_abs.yaml
 │   └── ...
-├── preprocess/   ← obs transforms before predict_action()
-│   ├── robomimic_image.yaml
+├── pipeline/        ← one file per (sensor setup × action space) combination
+│   │                   each file bundles preprocess + postprocess transforms
+│   ├── robomimic_single_arm_image_abs.yaml
+│   ├── robomimic_single_arm_image_rel.yaml
+│   ├── robomimic_bimanual_image_abs.yaml
+│   ├── robomimic_bimanual_image_rel.yaml
+│   ├── robomimic_lowdim_abs.yaml
+│   ├── robomimic_lowdim_rel.yaml
 │   ├── pusht_image.yaml
-│   └── identity.yaml
-└── postprocess/  ← action transforms after predict_action()
-    ├── rotation6d_to_axisangle.yaml
-    └── identity.yaml
+│   └── lowdim_identity.yaml
+├── store/           ← storage backend configs
+│   ├── zarr_disk.yaml
+│   ├── hdf5.yaml
+│   └── rlds_frame.yaml
+├── transforms/      ← three-tier per-sample transforms (disk/cpu/gpu)
+│   ├── disk/
+│   ├── cpu/
+│   └── gpu/
+└── train.yaml       ← default robo_dataset training config
 ```
 
-These configs are self-contained: `preprocess/` and `postprocess/` reference only
-`robo_dataset.transforms.*` classes; `datasource/` declares the dataset and
-env-runner structure consumed by the host learning-pipeline repo.
+---
 
-They are composed into any learning-pipeline config via Hydra `defaults:`:
+## `data_source/`
+
+One config per task / modality / action-space variant.  Contains everything
+about the data: what it contains, how to load it, and how to interpret it.
+
+### Obs + action shape
+
+Image tasks carry a `shape_meta` block:
 
 ```yaml
-# my_pipeline/config/pipeline/lift_diffusion_unet.yaml
-defaults:
-  - _self_
-  - /path/to/robo_dataset/config/datasource: lift_image_abs
-  - /path/to/robo_dataset/config/preprocess: robomimic_image
-  - /path/to/robo_dataset/config/postprocess: rotation6d_to_axisangle
-  - model: diffusion_unet_hybrid   # lives in the learning-pipeline repo
-
-horizon: 16
-n_obs_steps: 2
-n_action_steps: 8
+shape_meta:
+  obs:
+    agentview_image: {shape: [3, 84, 84], type: rgb}
+    robot0_eef_pos:  {shape: [3]}         # type default: low_dim
+    ...
+  action:
+    shape: [10]
+    fields:                    # single source of truth for action field indices
+      pos:      [0, 1, 2]
+      rotation: [3, 4, 5, 6, 7, 8]
+      gripper:  [9]
+    rotation_rep: rotation_6d          # representation stored in the dataset
+    output_rotation_rep: axis_angle    # representation expected by the robot
 ```
 
-Model configs and top-level pipeline configs live in the learning-pipeline repo,
-not here.
+Low-dim tasks carry a top-level `action` block (no `shape_meta`):
+
+```yaml
+obs_dim: 19
+action_dim: 10
+obs_keys: [...]
+
+action:
+  shape: [10]
+  fields:
+    pos:      [0, 1, 2]
+    rotation: [3, 4, 5, 6, 7, 8]
+    gripper:  [9]
+  rotation_rep: rotation_6d
+  output_rotation_rep: axis_angle
+```
+
+### Why `action.fields` lives here
+
+Index-to-field mapping is a property of *the dataset*, not the model or the
+transform chain.  It must be defined exactly once.  Pipeline configs reference
+it via Hydra interpolation (`${data_source.shape_meta.action.fields}` for image
+tasks, `${data_source.action.fields}` for low-dim), so transforms never
+hard-code numeric indices.
 
 ---
 
-## Layer responsibilities
+## `pipeline/`
 
-### `datasource/`
+One config per combination of sensor setup and action space.  Each file defines
+**both** `preprocess` and `postprocess` as `InferencePipeline` instances.
 
-Everything about the data: what it contains and how to load it. One config per
-task / modality / action-space variant. Migrated from diffusion_policy `config/task/`.
+```yaml
+preprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.NormalizeImages
+      keys: [agentview_image, robot0_eye_in_hand_image]
+      mean: [0.485, 0.456, 0.406]
+      std:  [0.229, 0.224, 0.225]
+      from_uint8: true
 
-Contains:
-- `shape_meta` — obs keys with shapes and types (`rgb` / `low_dim`); action shape
-- `dataset_path`, `task_name`, `dataset_type`, `abs_action`, `rotation_rep`
-- `dataset:` — `_target_` for the dataset class + constructor args
-- `env_runner:` — rollout environment for evaluation
+postprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.ConvertRotation
+      rotation_fields: [rotation]
+      action_fields: ${data_source.shape_meta.action.fields}
+      from_rep: ${data_source.shape_meta.action.rotation_rep}
+      to_rep:   ${data_source.shape_meta.action.output_rotation_rep}
+```
 
-Cross-references to pipeline-level params (`${horizon}`, `${n_obs_steps}`, etc.)
-are resolved after Hydra merges the defaults list.
+`preprocess` is applied to observations **before** `policy.predict_action()`.
+`postprocess` is applied to actions **after** `policy.predict_action()`.
+Both are applied identically at train time and inference time.
 
-### `preprocess/`
+### Available pipeline configs
 
-**Observation transforms applied identically at train time and inference time**,
-before `policy.predict_action()`. Serialised into the checkpoint so inference
-requires only the `.ckpt` file.
-
-| Config | Transforms |
-|---|---|
-| `robomimic_image` | `NormalizeImages` — agentview + eye-in-hand, ImageNet stats |
-| `pusht_image` | `ToFloat` — single camera, [0, 1] |
-| `identity` | no-op — for low-dim tasks |
-
-Only include transforms with **fixed** (non-data-dependent) parameters here.
-The policy's internal `LinearNormalizer` (fit from training data) lives inside
-the model and is saved with its weights.
-
-### `postprocess/`
-
-**Action transforms applied identically at train time and inference time**,
-after `policy.predict_action()`. Also serialised into the checkpoint.
-
-| Config | Transforms |
-|---|---|
-| `rotation6d_to_axisangle` | `ConvertRotation(start=3, end=9, rotation_6d→axis_angle)` — robomimic abs-action, 10-dim → 7-dim |
-| `identity` | no-op — relative-action / lowdim / push-t tasks |
-
-The policy's internal unnormalisation already runs inside `predict_action()`;
-postprocess covers structural conversions only.
+| Config | Preprocess | Postprocess |
+|---|---|---|
+| `robomimic_single_arm_image_abs` | NormalizeImages (agentview + eye-in-hand) | rotation_6d → axis_angle |
+| `robomimic_single_arm_image_rel` | NormalizeImages (agentview + eye-in-hand) | identity |
+| `robomimic_bimanual_image_abs` | NormalizeImages (4 cameras) | rotation_6d → axis_angle (×2) |
+| `robomimic_bimanual_image_rel` | NormalizeImages (4 cameras) | identity |
+| `robomimic_lowdim_abs` | identity | rotation_6d → axis_angle |
+| `robomimic_lowdim_rel` | identity | identity |
+| `pusht_image` | ToFloat (single camera, [0,1]) | identity |
+| `lowdim_identity` | identity | identity |
 
 ---
 
-## Adding new configs
+## Transform classes (`robo_dataset.transforms`)
 
-1. **New datasource**: add `config/datasource/<task>.yaml` with `shape_meta`, `dataset:`, `env_runner:`.
-2. **New preprocess**: add `config/preprocess/<name>.yaml` referencing `robo_dataset.transforms.*`.
-3. **New postprocess**: add `config/postprocess/<name>.yaml` referencing `robo_dataset.transforms.*`.
+```python
+from robo_dataset.transforms import (
+    InferencePipeline,     # chains InferenceTransform objects
+    NormalizeImages,       # ImageNet normalisation on obs image keys
+    ToFloat,               # uint8 → float32 in [0, 1]
+    IdentityObs,           # pass-through obs
+    ConvertRotation,       # rotation-rep conversion on named action fields
+    IdentityAction,        # pass-through action
+    RotationTransformer,   # direct API: .forward() / .inverse()
+)
+```
+
+### `ConvertRotation` design
+
+```python
+ConvertRotation(
+    rotation_fields=['rotation'],            # field names to convert
+    action_fields=<dict from data_source>,   # field → contiguous index list
+    from_rep='rotation_6d',
+    to_rep='axis_angle',
+)
+```
+
+`action_fields` is the single source of index truth, loaded from the
+data_source config via `${data_source.shape_meta.action.fields}`.
+`ConvertRotation.__init__` validates contiguous indices and derives
+`(start, end)` slices internally — numeric indices never appear in YAML.
+
+When `rotation_fields` contains multiple entries (bimanual tasks), fields
+are processed from highest to lowest index so earlier-field slices remain
+valid after higher-field slices change size.
+
+---
+
+## Using in a learning pipeline
+
+A learning pipeline config (lives in the learning pipeline repo, not here)
+composes data_source and pipeline via Hydra:
+
+```yaml
+defaults:
+  - data_source: lift_image_abs               # from robo_dataset/config/
+  - pipeline: robomimic_single_arm_image_abs  # from robo_dataset/config/
+  - _self_
+
+# Resolved values available at runtime:
+#   ${data_source.shape_meta}
+#   ${preprocess}   → InferencePipeline
+#   ${postprocess}  → InferencePipeline
+```
+
+Usage at runtime:
+
+```python
+preprocess  = hydra.utils.instantiate(cfg.preprocess)   # InferencePipeline
+postprocess = hydra.utils.instantiate(cfg.postprocess)  # InferencePipeline
+
+# training step
+obs  = preprocess(batch['obs'])
+loss = model.compute_loss({'obs': obs, 'action': batch['action']})
+
+# inference step (identical transforms)
+obs    = preprocess(live_observation)
+action = postprocess(policy.predict_action(obs)['action'])
+```
+
+---
+
+## Adding a new use-case
+
+1. **New task**: add `config/data_source/<task>.yaml` with `shape_meta`
+   (or `obs_dim`/`action_dim` for low-dim), `dataset`, `env_runner`, and
+   `action.fields`.
+2. **New sensor/action-space combination**: add `config/pipeline/<name>.yaml`
+   with `preprocess` and `postprocess` blocks.
+3. No Python changes required unless the transform class itself is novel.

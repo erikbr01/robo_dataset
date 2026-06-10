@@ -1,0 +1,23 @@
+# Transforms for bimanual robomimic image rel-action tasks.
+# Compatible data_sources: transport_image
+#
+# Preprocess:  ImageNet-normalise 4 cameras (shoulder + eye-in-hand × 2)
+# Postprocess: identity — action is already axis_angle (14-dim), no conversion needed
+
+preprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.NormalizeImages
+      keys:
+        - shouldercamera0_image
+        - robot0_eye_in_hand_image
+        - shouldercamera1_image
+        - robot1_eye_in_hand_image
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+      from_uint8: true
+
+postprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.IdentityAction

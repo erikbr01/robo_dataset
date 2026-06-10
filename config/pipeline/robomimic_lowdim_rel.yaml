@@ -1,0 +1,16 @@
+# Transforms for robomimic low-dim rel-action tasks.
+# Compatible data_sources: lift_lowdim, can_lowdim, square_lowdim, tool_hang_lowdim,
+#                          transport_lowdim
+#
+# Preprocess:  identity
+# Postprocess: identity — action is already axis_angle, no conversion needed
+
+preprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.IdentityObs
+
+postprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.IdentityAction

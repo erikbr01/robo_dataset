@@ -1,0 +1,16 @@
+# Transforms for low-dim tasks with no rotation conversion.
+# Compatible data_sources: pusht_lowdim, blockpush_lowdim_seed, blockpush_lowdim_seed_abs,
+#                          kitchen_lowdim, kitchen_lowdim_abs
+#
+# Preprocess:  identity
+# Postprocess: identity
+
+preprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.IdentityObs
+
+postprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.IdentityAction

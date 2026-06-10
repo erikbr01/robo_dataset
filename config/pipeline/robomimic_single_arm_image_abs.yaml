@@ -1,0 +1,23 @@
+# Transforms for single-arm robomimic image abs-action tasks.
+# Compatible data_sources: lift_image_abs, can_image_abs, square_image_abs, tool_hang_image_abs
+#
+# Preprocess:  ImageNet-normalise agentview + eye-in-hand cameras (uint8 → float)
+# Postprocess: rotation_6d (10-dim) → axis_angle (7-dim)
+
+preprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.NormalizeImages
+      keys: [agentview_image, robot0_eye_in_hand_image]
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+      from_uint8: true
+
+postprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.ConvertRotation
+      rotation_fields: [rotation]
+      action_fields: ${data_source.shape_meta.action.fields}
+      from_rep: ${data_source.shape_meta.action.rotation_rep}
+      to_rep: ${data_source.shape_meta.action.output_rotation_rep}

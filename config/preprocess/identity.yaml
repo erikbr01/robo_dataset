@@ -1,5 +1,0 @@
-# No-op preprocess — for low-dim tasks where the policy's internal
-# LinearNormalizer handles all obs scaling.
-_target_: robo_dataset.transforms.InferencePipeline
-transforms:
-  - _target_: robo_dataset.transforms.IdentityObs

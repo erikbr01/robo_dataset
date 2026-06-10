@@ -1,6 +1,6 @@
 defaults:
   - store: zarr_disk
-  - shape_meta: robomimic_lift_ph
+  - data_source: lift_image_abs
   - transforms/disk@disk_transforms: resize
   - transforms/cpu@cpu_transform: split_obs_image
   - transforms/gpu@gpu_transform: random_crop

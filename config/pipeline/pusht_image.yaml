@@ -1,0 +1,16 @@
+# Transforms for Push-T image tasks.
+# Compatible data_sources: pusht_image, real_pusht_image
+#
+# Preprocess:  uint8 → float32 in [0, 1] (single camera)
+# Postprocess: identity — 2-dim position action, no rotation
+
+preprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.ToFloat
+      keys: [image]
+
+postprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.IdentityAction

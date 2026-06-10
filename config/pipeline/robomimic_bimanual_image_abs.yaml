@@ -1,0 +1,29 @@
+# Transforms for bimanual robomimic image abs-action tasks.
+# Compatible data_sources: transport_image_abs
+#
+# Preprocess:  ImageNet-normalise 4 cameras (shoulder + eye-in-hand × 2)
+# Postprocess: rotation_6d (20-dim) → axis_angle (14-dim) for both arms.
+#              robot1_rotation is converted first (higher indices) so that
+#              robot0_rotation indices remain valid for the second conversion.
+
+preprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.NormalizeImages
+      keys:
+        - shouldercamera0_image
+        - robot0_eye_in_hand_image
+        - shouldercamera1_image
+        - robot1_eye_in_hand_image
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+      from_uint8: true
+
+postprocess:
+  _target_: robo_dataset.transforms.InferencePipeline
+  transforms:
+    - _target_: robo_dataset.transforms.ConvertRotation
+      rotation_fields: [robot0_rotation, robot1_rotation]
+      action_fields: ${data_source.shape_meta.action.fields}
+      from_rep: ${data_source.shape_meta.action.rotation_rep}
+      to_rep: ${data_source.shape_meta.action.output_rotation_rep}

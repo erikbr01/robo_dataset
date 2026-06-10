@@ -62,3 +62,45 @@ def rlds_store_path(synthetic_hdf5, tmp_path_factory):
     out_path = str(tmp_path_factory.mktemp("rlds") / "test.rlds")
     convert_rlds(hdf5, out_path, image_keys=OBS_KEYS, jpeg_quality=95, verbose=False)
     return out_path
+
+
+@pytest.fixture(scope="session")
+def zarr_sharded_path(synthetic_hdf5, tmp_path_factory):
+    """Convert synthetic HDF5 to sharded zarr-v3 and return the path."""
+    from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+    from robo_dataset.backends.zarr_sharded import ZarrShardedStoreWriter
+    from robo_dataset.convert import convert
+
+    hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+    out_path = str(tmp_path_factory.mktemp("zarr_sharded") / "test_sharded.zarr")
+    writer = ZarrShardedStoreWriter.create(
+        path=out_path,
+        key_shapes={k: hdf5.frame_shape(k) for k in hdf5.keys},
+        key_dtypes={k: hdf5.frame_dtype(k) for k in hdf5.keys},
+        chunk_frames=4,
+        shard_frames=16,
+    )
+    convert(hdf5, writer, verbose=False)
+    return out_path
+
+
+@pytest.fixture(scope="session")
+def video_store_path(synthetic_hdf5, tmp_path_factory):
+    """Convert synthetic HDF5 to VideoStore (h264 kfi=1) and return the path."""
+    pytest.importorskip("av")
+    from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+    from robo_dataset.backends.video import VideoStoreWriter
+    from robo_dataset.convert import convert
+
+    hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+    out_path = str(tmp_path_factory.mktemp("video") / "test.video")
+    writer = VideoStoreWriter.create(
+        path=out_path,
+        key_shapes={k: hdf5.frame_shape(k) for k in hdf5.keys},
+        key_dtypes={k: hdf5.frame_dtype(k) for k in hdf5.keys},
+        image_keys=OBS_KEYS,
+        kfi=1,
+        fps=10,
+    )
+    convert(hdf5, writer, verbose=False)
+    return out_path

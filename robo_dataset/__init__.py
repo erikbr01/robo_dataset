@@ -11,9 +11,13 @@ from .backends import (
     RobomimicHDF5Store,
     ZarrStore,
     ZarrStoreWriter,
+    ZarrShardedStore,
+    ZarrShardedStoreWriter,
     RLDSFrameStore,
     RLDSFrameStoreWriter,
     ShmStore,
+    VideoStore,
+    VideoStoreWriter,
 )
 from .sampler import SequenceSampler, get_val_mask
 from .convert import convert, convert_rlds
@@ -24,9 +28,13 @@ __all__ = [
     "RobomimicHDF5Store",
     "ZarrStore",
     "ZarrStoreWriter",
+    "ZarrShardedStore",
+    "ZarrShardedStoreWriter",
     "RLDSFrameStore",
     "RLDSFrameStoreWriter",
     "ShmStore",
+    "VideoStore",
+    "VideoStoreWriter",
     "SequenceSampler",
     "get_val_mask",
     "convert",

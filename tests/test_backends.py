@@ -347,6 +347,92 @@ class TestShmStore:
         assert batch["action"].shape == (4, 4, ACTION_DIM)
 
 
+# ── ZarrShardedStore equivalence ─────────────────────────────────────────────
+
+class TestZarrShardedEquivalence:
+    """Sharded zarr-v3 store must return the same data as HDF5 (bit-exact for lz4)."""
+
+    def test_episode_metadata(self, synthetic_hdf5, zarr_sharded_path):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        sharded = ZarrShardedStore(zarr_sharded_path)
+        assert sharded.n_episodes == hdf5.n_episodes
+        np.testing.assert_array_equal(sharded.episode_ends, hdf5.episode_ends)
+
+    def test_action_exact(self, synthetic_hdf5, zarr_sharded_path):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        sharded = ZarrShardedStore(zarr_sharded_path)
+        h = hdf5.get_sequence("action", 0, hdf5.n_frames)
+        s = sharded.get_sequence("action", 0, sharded.n_frames)
+        np.testing.assert_array_equal(h, s)
+
+    def test_lowdim_exact(self, synthetic_hdf5, zarr_sharded_path):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        sharded = ZarrShardedStore(zarr_sharded_path)
+        h = hdf5.get_sequence(LOWDIM_KEY, 0, hdf5.n_frames)
+        s = sharded.get_sequence(LOWDIM_KEY, 0, sharded.n_frames)
+        np.testing.assert_array_equal(h, s)
+
+    def test_images_lossless(self, synthetic_hdf5, zarr_sharded_path):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        sharded = ZarrShardedStore(zarr_sharded_path)
+        for key in OBS_KEYS:
+            h = hdf5.get_sequence(key, 0, hdf5.n_frames)
+            s = sharded.get_sequence(key, 0, sharded.n_frames)
+            np.testing.assert_array_equal(h, s)
+
+    def test_cross_shard_boundary_read(self, zarr_sharded_path):
+        """Slice spanning two shard files must return correct data (shard_frames=16 in fixture)."""
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStore
+        sharded = ZarrShardedStore(zarr_sharded_path)
+        # Read 4 frames across the first shard boundary (frames 14–18, straddles shard at 16)
+        n = int(sharded.episode_ends[-1])
+        end = min(18, n)
+        start = max(0, end - 4)
+        seq = sharded.get_sequence(OBS_KEYS[0], start, end)
+        assert seq.shape == (end - start, H, W, C)
+
+    def test_file_count_much_less_than_frames(self, zarr_sharded_path):
+        """Sharded store should have far fewer data files than frames."""
+        import os
+        n_files = sum(len(files) for _, _, files in os.walk(zarr_sharded_path))
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStore
+        sharded = ZarrShardedStore(zarr_sharded_path)
+        n_frames = int(sharded.episode_ends[-1])
+        assert n_files < n_frames, (
+            f"Expected fewer files ({n_files}) than frames ({n_frames}) in sharded store"
+        )
+
+    def test_dataloader_multiworker(self, zarr_sharded_path):
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStore
+        from robo_dataset.dataset import TrajectoryDataset
+        store = ZarrShardedStore(zarr_sharded_path)
+        dataset = TrajectoryDataset(store, horizon=4, pad_before=1, pad_after=1)
+        loader = dataset.make_dataloader(batch_size=4, num_workers=2, shuffle=False)
+        batch = next(iter(loader))
+        assert batch[OBS_KEYS[0]].shape == (4, 4, H, W, C)
+        assert batch["action"].shape == (4, 4, ACTION_DIM)
+
+    def test_shard_params_roundtrip(self, zarr_sharded_path):
+        """chunk_frames and shard_frames survive the meta.json roundtrip."""
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStore
+        sharded = ZarrShardedStore(zarr_sharded_path)
+        assert sharded._chunk_frames == 4
+        assert sharded._shard_frames == 16
+
+    def test_invalid_shard_frames_raises(self, tmp_path):
+        from robo_dataset.backends.zarr_sharded import ZarrShardedStoreWriter
+        with pytest.raises(ValueError, match="multiple"):
+            ZarrShardedStoreWriter(str(tmp_path / "bad"), chunk_frames=8, shard_frames=100)
+
+
 # ── apply_disk_cached with RLDS writer ────────────────────────────────────────
 
 class TestDiskCacheRLDSWriter:
@@ -387,3 +473,107 @@ class TestDiskCacheRLDSWriter:
                           image_keys=OBS_KEYS, writer_cls=RLDSFrameStoreWriter)
         mtime_after = os.path.getmtime(os.path.join(cache_path, "meta.json"))
         assert mtime_before == mtime_after
+
+
+# ── VideoStore equivalence ────────────────────────────────────────────────────
+
+pytestmark_video = pytest.mark.skipif(
+    not pytest.importorskip("av", reason="PyAV not installed") and True,
+    reason="PyAV not installed",
+)
+
+
+@pytest.fixture(scope="module")
+def _video_imports():
+    """Skip entire class if torchcodec or av is unavailable."""
+    pytest.importorskip("av")
+    pytest.importorskip("torchcodec")
+
+
+class TestVideoStoreEquivalence:
+    """VideoStore must return PSNR >= 30 dB for video keys; exact for non-video keys."""
+
+    pytestmark = pytest.mark.usefixtures("_video_imports")
+
+    def test_episode_metadata(self, synthetic_hdf5, video_store_path):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.video import VideoStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        vs = VideoStore(video_store_path)
+        assert vs.n_episodes == hdf5.n_episodes
+        np.testing.assert_array_equal(vs.episode_ends, hdf5.episode_ends)
+
+    def test_action_exact(self, synthetic_hdf5, video_store_path):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.video import VideoStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        vs = VideoStore(video_store_path)
+        h = hdf5.get_sequence("action", 0, hdf5.n_frames)
+        v = vs.get_sequence("action", 0, vs.n_frames)
+        np.testing.assert_array_equal(h, v)
+
+    def test_lowdim_exact(self, synthetic_hdf5, video_store_path):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.video import VideoStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        vs = VideoStore(video_store_path)
+        h = hdf5.get_sequence(LOWDIM_KEY, 0, hdf5.n_frames)
+        v = vs.get_sequence(LOWDIM_KEY, 0, vs.n_frames)
+        np.testing.assert_array_equal(h, v)
+
+    def test_images_psnr(self, synthetic_hdf5, video_store_path):
+        """H.264 kfi=1 images must achieve PSNR >= 30 dB vs original."""
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.video import VideoStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        vs = VideoStore(video_store_path)
+        for key in OBS_KEYS:
+            h = hdf5.get_sequence(key, 0, hdf5.n_frames)
+            v = vs.get_sequence(key, 0, vs.n_frames)
+            assert v.shape == h.shape
+            psnr = _psnr(h, v)
+            assert psnr >= 30.0, f"{key}: PSNR={psnr:.1f} dB < 30 dB"
+
+    def test_cross_episode_read(self, synthetic_hdf5, video_store_path):
+        """Sequence spanning two episodes must decode correctly."""
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.video import VideoStore
+        hdf5 = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        vs = VideoStore(video_store_path)
+        # Last 3 frames of ep0 + first 3 of ep1
+        start = EP_LENGTHS[0] - 3
+        end = EP_LENGTHS[0] + 3
+        seq = vs.get_sequence(OBS_KEYS[0], start, end)
+        assert seq.shape == (6, H, W, C)
+        assert seq.dtype == np.uint8
+
+    def test_meta_roundtrip(self, video_store_path):
+        """video_keys, vcodec, kfi survive the meta.json roundtrip."""
+        import json
+        with open(f"{video_store_path}/meta.json") as f:
+            meta = json.load(f)
+        assert set(OBS_KEYS).issubset(set(meta["video_keys"]))
+        assert meta["vcodec"] == "libx264"
+        assert meta["kfi"] == 1
+
+    def test_lru_eviction(self, video_store_path):
+        """LRU cache evicts oldest decoder when maxsize is exceeded."""
+        from robo_dataset.backends.video import VideoStore
+        vs = VideoStore(video_store_path, max_decoders=2)
+        # Access 3 different (key, ep_idx) combos — the first should be evicted
+        vs._get_decoder(OBS_KEYS[0], 0)
+        vs._get_decoder(OBS_KEYS[0], 1)
+        vs._get_decoder(OBS_KEYS[0], 2)
+        assert len(vs._decoder_cache._cache) == 2
+        assert (OBS_KEYS[0], 0) not in vs._decoder_cache._cache
+
+    def test_dataloader_multiworker(self, video_store_path):
+        """VideoStore works in a multi-worker DataLoader (fork-safe)."""
+        from robo_dataset.backends.video import VideoStore
+        from robo_dataset.dataset import TrajectoryDataset
+        vs = VideoStore(video_store_path)
+        dataset = TrajectoryDataset(vs, horizon=4, pad_before=1, pad_after=1)
+        loader = dataset.make_dataloader(batch_size=4, num_workers=2, shuffle=False)
+        batch = next(iter(loader))
+        assert batch[OBS_KEYS[0]].shape == (4, 4, H, W, C)
+        assert batch["action"].shape == (4, 4, ACTION_DIM)

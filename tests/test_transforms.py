@@ -458,3 +458,54 @@ class TestChannelsLastGPU:
         out = t(batch)
         for key in OBS_KEYS:
             assert out[key].is_contiguous(memory_format=torch.channels_last)
+
+
+class TestRandomCropPerTimestep:
+    def test_per_timestep_offsets_vary(self):
+        import torch
+        from robo_dataset.transforms.gpu_batch import RandomCrop
+        torch.manual_seed(0)
+        t = RandomCrop(image_keys=["img"], size=(8, 8), pad=0, per_timestep=True)
+        # A coordinate ramp makes the crop offset readable from the output.
+        H = W = 32
+        ramp = torch.arange(H * W, dtype=torch.float32).view(1, 1, 1, H, W)
+        batch = {"img": ramp.expand(2, 6, 1, H, W).clone()}
+        out = t(batch)["img"]
+        assert out.shape == (2, 6, 1, 8, 8)
+        # With per-timestep sampling, 12 windows almost surely differ somewhere.
+        corners = {float(out[b, s, 0, 0, 0]) for b in range(2) for s in range(6)}
+        assert len(corners) > 1
+
+    def test_shared_offsets_when_disabled(self):
+        import torch
+        from robo_dataset.transforms.gpu_batch import RandomCrop
+        torch.manual_seed(0)
+        t = RandomCrop(image_keys=["img"], size=(8, 8), pad=0, per_timestep=False)
+        H = W = 32
+        ramp = torch.arange(H * W, dtype=torch.float32).view(1, 1, 1, H, W)
+        batch = {"img": ramp.expand(2, 6, 1, H, W).clone()}
+        out = t(batch)["img"]
+        for b in range(2):
+            corners = {float(out[b, s, 0, 0, 0]) for s in range(6)}
+            assert len(corners) == 1, "offsets must be shared across timesteps"
+
+
+class TestCenterCrop:
+    def test_center_crop_values(self):
+        import torch
+        from robo_dataset.transforms.gpu_batch import CenterCrop
+        t = CenterCrop(image_keys=["img"], size=(8, 8))
+        H = W = 12
+        x = torch.arange(H * W, dtype=torch.float32).view(1, 1, 1, H, W)
+        out = t({"img": x})["img"]
+        assert out.shape == (1, 1, 1, 8, 8)
+        # top-left of center crop = (2, 2)
+        assert float(out[0, 0, 0, 0, 0]) == float(x[0, 0, 0, 2, 2])
+
+    def test_noop_at_target_size(self):
+        import torch
+        from robo_dataset.transforms.gpu_batch import CenterCrop
+        t = CenterCrop(image_keys=["img"], size=(8, 8))
+        x = torch.randn(2, 3, 1, 8, 8)
+        out = t({"img": x})["img"]
+        assert out is x

@@ -58,12 +58,16 @@ class RandomCrop(GPUBatchTransform):
     Random crop augmentation for image keys.
 
     Pads each image by `pad` pixels on each side, then takes a random `size × size` crop.
-    The same crop offset is applied to all timesteps within one batch element.
+    By default the same crop offset is applied to all timesteps within one batch
+    element; set ``per_timestep=True`` to sample an independent offset per
+    (batch, timestep) — matching diffusion_policy's CropRandomizer, which crops
+    each obs frame independently.
 
     Args:
-        image_keys:  Keys to apply cropping to.
-        size:        Output spatial size (H, W) after crop.
-        pad:         Padding on each side before crop.
+        image_keys:   Keys to apply cropping to.
+        size:         Output spatial size (H, W) after crop.
+        pad:          Padding on each side before crop (0 = crop within the image).
+        per_timestep: Sample an independent offset per (B, T) element.
     """
 
     def __init__(
@@ -71,10 +75,12 @@ class RandomCrop(GPUBatchTransform):
         image_keys: List[str],
         size: Tuple[int, int],
         pad: int = 4,
+        per_timestep: bool = False,
     ):
         self.image_keys = set(image_keys)
         self.size = size
         self.pad = pad
+        self.per_timestep = per_timestep
 
     @torch.no_grad()
     def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -86,20 +92,47 @@ class RandomCrop(GPUBatchTransform):
             B, T, C, H, W = x.shape
             oh, ow = self.size
 
-            # Pad: (B, T, C, H+2p, W+2p)
-            x_pad = F.pad(x.view(B * T, C, H, W), [self.pad] * 4, mode="reflect")
+            flat = x.view(B * T, C, H, W)
+            if self.pad > 0:
+                flat = F.pad(flat, [self.pad] * 4, mode="reflect")
             PH, PW = H + 2 * self.pad, W + 2 * self.pad
 
-            # Sample one crop offset per batch element (shared across T)
-            top = torch.randint(0, PH - oh + 1, (B,), device=x.device)
-            left = torch.randint(0, PW - ow + 1, (B,), device=x.device)
+            n_offsets = B * T if self.per_timestep else B
+            top = torch.randint(0, PH - oh + 1, (n_offsets,), device=x.device)
+            left = torch.randint(0, PW - ow + 1, (n_offsets,), device=x.device)
+            if not self.per_timestep:
+                top = top.repeat_interleave(T)
+                left = left.repeat_interleave(T)
 
-            crops = []
-            for b in range(B):
-                # Extract crop for all T timesteps of this batch element
-                patch = x_pad[b * T : (b + 1) * T, :, top[b] : top[b] + oh, left[b] : left[b] + ow]
-                crops.append(patch)
-            out[key] = torch.stack(crops)  # (B, T, C, oh, ow)
+            crops = [
+                flat[i, :, top[i] : top[i] + oh, left[i] : left[i] + ow]
+                for i in range(B * T)
+            ]
+            out[key] = torch.stack(crops).view(B, T, C, oh, ow)
+        return out
+
+
+class CenterCrop(GPUBatchTransform):
+    """Deterministic center crop for image keys — the evaluation-time
+    counterpart of :class:`RandomCrop`. No-op when already at target size."""
+
+    def __init__(self, image_keys: List[str], size: Tuple[int, int]):
+        self.image_keys = set(image_keys)
+        self.size = size
+
+    @torch.no_grad()
+    def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(batch)
+        oh, ow = self.size
+        for key in self.image_keys:
+            if key not in batch:
+                continue
+            x = batch[key]  # (B, T, C, H, W)
+            H, W = x.shape[-2:]
+            if (H, W) == (oh, ow):
+                continue
+            top, left = (H - oh) // 2, (W - ow) // 2
+            out[key] = x[..., top : top + oh, left : left + ow]
         return out
 
 

@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .base import TrajectoryStore
+from .base import TrajectoryStore, iter_episode_slices
 from .video import _DECODER_CLS, _LRUDecoderCache, _pick_decoder_backend
 
 _DEFAULT_MAX_DECODERS = 32
@@ -81,9 +81,11 @@ class LeRobotStore(TrajectoryStore):
         self._parquet_key_map: Dict[str, Tuple[str, int, Optional[int]]] = {}
 
         if self._modality is not None:
+            bad_entries: List[str] = []
             for name, spec in self._modality.get("video", {}).items():
                 feat = spec["original_key"]
                 if feat not in self._video_features:
+                    bad_entries.append(f"video.{name} → {feat!r}")
                     continue
                 key = f"video.{name}"
                 self._video_key_map[key] = feat
@@ -94,12 +96,18 @@ class LeRobotStore(TrajectoryStore):
                 for name, spec in self._modality.get(group, {}).items():
                     col = spec["original_key"]
                     if col not in self._parquet_features:
+                        bad_entries.append(f"{group}.{name} → {col!r}")
                         continue
                     key = f"{group}.{name}"
                     start, end = int(spec["start"]), int(spec["end"])
                     self._parquet_key_map[key] = (col, start, end)
                     self._shapes[key] = (end - start,)
                     self._dtypes[key] = np.dtype(np.float32)
+            if bad_entries:
+                raise ValueError(
+                    f"modality.json at {modality_path!r} references features "
+                    f"absent from info.json features: {bad_entries}"
+                )
         else:
             for feat, attr in self._video_features.items():
                 self._video_key_map[feat] = feat
@@ -144,6 +152,14 @@ class LeRobotStore(TrajectoryStore):
 
         self._decoder_cache = _LRUDecoderCache(maxsize=max_decoders)
         self._episode_cache: OrderedDict = OrderedDict()  # ep_idx → {col: ndarray}
+        self._cache_pid = os.getpid()
+
+    def _check_fork(self) -> None:
+        """Self-defending fork safety: drop caches inherited across fork."""
+        if os.getpid() != self._cache_pid:
+            self._decoder_cache.clear()
+            self._episode_cache.clear()
+            self._cache_pid = os.getpid()
 
     @property
     def schemas(self):
@@ -180,6 +196,7 @@ class LeRobotStore(TrajectoryStore):
     def on_worker_init(self, worker_id: int) -> None:
         self._decoder_cache.clear()
         self._episode_cache.clear()
+        self._cache_pid = os.getpid()
 
     # ── Path resolution ───────────────────────────────────────────────────────
 
@@ -203,16 +220,21 @@ class LeRobotStore(TrajectoryStore):
     # ── Parquet reads ─────────────────────────────────────────────────────────
 
     def _episode_table(self, ep_idx: int) -> Dict[str, np.ndarray]:
+        self._check_fork()
         cached = self._episode_cache.get(ep_idx)
         if cached is not None:
             self._episode_cache.move_to_end(ep_idx)
             return cached
         import pyarrow.parquet as pq
-        table = pq.read_table(self._parquet_path(ep_idx))
+        parquet_path = self._parquet_path(ep_idx)
+        table = pq.read_table(parquet_path)
         data: Dict[str, np.ndarray] = {}
         for col, _, _ in set(self._parquet_key_map.values()):
             if col not in table.column_names:
-                continue
+                raise KeyError(
+                    f"Column {col!r} (mapped from store keys) is missing from "
+                    f"parquet file {parquet_path!r}"
+                )
             cells = table.column(col).to_pylist()
             data[col] = np.asarray(cells, dtype=np.float32)
         if len(self._episode_cache) >= _EPISODE_CACHE_SIZE:
@@ -223,6 +245,7 @@ class LeRobotStore(TrajectoryStore):
     # ── Video reads ───────────────────────────────────────────────────────────
 
     def _decode_frames(self, key: str, ep_idx: int, local_indices: List[int]) -> np.ndarray:
+        self._check_fork()
         cache_key = (key, ep_idx)
         dec = self._decoder_cache.get(cache_key)
         if dec is None:
@@ -234,15 +257,8 @@ class LeRobotStore(TrajectoryStore):
     # ── get_sequence ──────────────────────────────────────────────────────────
 
     def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
-        ep_first = int(np.searchsorted(self._episode_ends, start, side="right"))
-        ep_last = int(np.searchsorted(self._episode_ends, end - 1, side="right"))
-
         parts = []
-        for ep_idx in range(ep_first, ep_last + 1):
-            ep_offset = int(self._episode_ends[ep_idx - 1]) if ep_idx > 0 else 0
-            ep_end_global = int(self._episode_ends[ep_idx])
-            lo = max(start, ep_offset) - ep_offset
-            hi = min(end, ep_end_global) - ep_offset
+        for ep_idx, lo, hi in iter_episode_slices(self._episode_ends, start, end):
             if key in self._video_key_map:
                 parts.append(self._decode_frames(key, ep_idx, list(range(lo, hi))))
             else:

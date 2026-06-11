@@ -130,6 +130,11 @@ class SequenceSampler:
         self.sequence_length = sequence_length
         self.keys = list(keys) if keys is not None else list(store.keys)
         self.key_first_k = key_first_k or {}
+        bad_first_k = {k: v for k, v in self.key_first_k.items() if v < 1}
+        if bad_first_k:
+            raise ValueError(
+                f"key_first_k values must be >= 1, got {bad_first_k}"
+            )
 
         episode_ends = store.episode_ends
         if episode_mask is None:
@@ -155,6 +160,11 @@ class SequenceSampler:
                 pad_before,
                 pad_after,
             )
+
+        # numba's np.array([]) yields shape (0,) float64 — normalize the empty
+        # result so callers always see (0, 4) int64.
+        if self.indices.size == 0:
+            self.indices = np.zeros((0, 4), dtype=np.int64)
 
     def __len__(self) -> int:
         return len(self.indices)

@@ -45,7 +45,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .base import TrajectoryStore
+from .base import TrajectoryStore, iter_episode_slices
 
 _EPISODE_CACHE_SIZE = 2
 _LOWDIM_KEYS = {
@@ -356,12 +356,8 @@ class DroidStore(TrajectoryStore):
         self._episode_cache.clear()
 
     def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
-        ep_first = int(np.searchsorted(self._episode_ends, start, side="right"))
-        ep_last = int(np.searchsorted(self._episode_ends, end - 1, side="right"))
-        parts = []
-        for ep_idx in range(ep_first, ep_last + 1):
-            ep_offset = int(self._episode_ends[ep_idx - 1]) if ep_idx > 0 else 0
-            lo = max(start, ep_offset) - ep_offset
-            hi = min(end, int(self._episode_ends[ep_idx])) - ep_offset
-            parts.append(self._load_episode(ep_idx)[key][lo:hi])
+        parts = [
+            self._load_episode(ep_idx)[key][lo:hi]
+            for ep_idx, lo, hi in iter_episode_slices(self._episode_ends, start, end)
+        ]
         return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]

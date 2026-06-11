@@ -26,7 +26,7 @@ import numpy as np
 import zarr
 from zarr.codecs import ShardingCodec, BytesCodec, BloscCodec
 
-from .base import TrajectoryStore, WritableTrajectoryStore
+from .base import TrajectoryStore, WritableTrajectoryStore, validate_episode_ends
 
 _META_FILE = "meta.json"
 _DEFAULT_CHUNK_FRAMES = 8
@@ -141,6 +141,7 @@ class ZarrShardedStore(TrajectoryStore):
         from ..schema import schemas_from_meta
         self._schemas = schemas_from_meta(meta)
         self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
+        validate_episode_ends(self._episode_ends, meta.get("n_frames"), path=path)
         self._arrays: Optional[Dict[str, zarr.Array]] = None
         self._open_arrays()
 
@@ -228,6 +229,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         self._dtypes: Dict[str, str] = {}
         self._frame_count = 0
         self._finalized = False
+        self._init_contract()
 
     @classmethod
     def create(
@@ -242,7 +244,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         schemas=None,
         **kwargs,
     ) -> "ZarrShardedStoreWriter":
-        return cls(
+        writer = cls(
             path=path,
             chunk_frames=chunk_frames,
             shard_frames=shard_frames,
@@ -250,6 +252,8 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
             jpeg_level=jpeg_level,
             schemas=schemas,
         )
+        writer._init_contract(key_shapes, key_dtypes)
+        return writer
 
     @classmethod
     def open_readonly(cls, path: str) -> ZarrShardedStore:
@@ -277,12 +281,8 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
 
     def put_episode(self, data: Dict[str, np.ndarray]) -> None:
         assert not self._finalized, "Cannot write after finalize()"
-        T = None
+        T = self._validate_episode(data, episode_idx=len(self._episode_ends_list))
         for key, arr in data.items():
-            if T is None:
-                T = arr.shape[0]
-            else:
-                assert arr.shape[0] == T, f"Episode length mismatch on key {key!r}"
             zarr_arr = self._get_or_create_array(key, arr[0])
             old = zarr_arr.shape[0]
             zarr_arr.resize((old + T,) + tuple(zarr_arr.shape[1:]))
@@ -293,6 +293,11 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
     def finalize(self) -> None:
         from ..schema import schemas_to_meta, validate_schemas_against_shapes
         validate_schemas_against_shapes(self._schemas, self._shapes)
+        for key, arr in self._arrays.items():
+            assert arr.shape[0] == self._frame_count, (
+                f"Key {key!r}: stored {arr.shape[0]} frames, expected "
+                f"{self._frame_count} — store is inconsistent."
+            )
         ep_ends = np.array(self._episode_ends_list, dtype=np.int64)
         np.save(os.path.join(self.path, "episode_ends.npy"), ep_ends)
         meta = {

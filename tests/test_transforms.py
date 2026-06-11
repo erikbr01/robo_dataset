@@ -490,6 +490,54 @@ class TestRandomCropPerTimestep:
             assert len(corners) == 1, "offsets must be shared across timesteps"
 
 
+def _random_crop_loop_reference(x, size, pad, per_timestep):
+    """The pre-vectorization RandomCrop loop, kept verbatim as RNG-semantics
+    reference: same torch.randint calls in the same order and shapes."""
+    import torch.nn.functional as F
+    B, T, C, H, W = x.shape
+    oh, ow = size
+    flat = x.view(B * T, C, H, W)
+    if pad > 0:
+        flat = F.pad(flat, [pad] * 4, mode="reflect")
+    PH, PW = H + 2 * pad, W + 2 * pad
+    n_offsets = B * T if per_timestep else B
+    top = torch.randint(0, PH - oh + 1, (n_offsets,), device=x.device)
+    left = torch.randint(0, PW - ow + 1, (n_offsets,), device=x.device)
+    if not per_timestep:
+        top = top.repeat_interleave(T)
+        left = left.repeat_interleave(T)
+    crops = [
+        flat[i, :, top[i] : top[i] + oh, left[i] : left[i] + ow]
+        for i in range(B * T)
+    ]
+    return torch.stack(crops).view(B, T, C, oh, ow)
+
+
+class TestRandomCropVectorizedEquivalence:
+    """The vectorized RandomCrop must be bit-identical to the original
+    per-element loop for a fixed seed (same RNG draws, same crops)."""
+
+    @pytest.mark.parametrize("per_timestep", [False, True])
+    @pytest.mark.parametrize("pad", [0, 4])
+    def test_matches_loop_reference(self, per_timestep, pad):
+        from robo_dataset.transforms.gpu_batch import RandomCrop
+        x = torch.randn(3, 5, 2, 20, 24)
+
+        torch.manual_seed(1234)
+        expected = _random_crop_loop_reference(
+            x, size=(12, 14), pad=pad, per_timestep=per_timestep
+        )
+
+        torch.manual_seed(1234)
+        crop = RandomCrop(
+            image_keys=["img"], size=(12, 14), pad=pad, per_timestep=per_timestep
+        )
+        got = crop({"img": x})["img"]
+
+        assert got.shape == expected.shape
+        assert torch.equal(got, expected)
+
+
 class TestCenterCrop:
     def test_center_crop_values(self):
         import torch

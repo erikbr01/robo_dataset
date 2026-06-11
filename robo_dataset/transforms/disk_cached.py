@@ -86,7 +86,12 @@ class ResizeImages(DiskCachedTransform):
         result = dict(ep_data)
         for key in self.image_keys:
             if key not in ep_data:
-                continue
+                # Disk-cached output is permanent — silently skipping a
+                # configured key would bake the omission into the cache.
+                raise KeyError(
+                    f"ResizeImages: configured image key {key!r} is missing from "
+                    f"the episode (available keys: {sorted(ep_data)})."
+                )
             frames = ep_data[key]  # (T, H, W, C) uint8
             T = frames.shape[0]
             out = np.empty((T, self.target_h, self.target_w, frames.shape[3]), dtype=frames.dtype)

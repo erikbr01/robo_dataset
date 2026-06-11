@@ -9,6 +9,7 @@ Compatible with zarr v2 and v3 (uses zarr_format=2 to keep numcodecs compressors
 """
 
 import json
+import logging
 import os
 from typing import Dict, List, Optional
 
@@ -16,11 +17,14 @@ import numpy as np
 import zarr
 import numcodecs
 
-from .base import TrajectoryStore, WritableTrajectoryStore
+from .base import TrajectoryStore, WritableTrajectoryStore, validate_episode_ends
+
+log = logging.getLogger(__name__)
 
 _ZARR_MAJOR = int(zarr.__version__.split(".")[0])
 _JPEG_QUALITY = 75
 _META_FILE = "meta.json"
+_NON_IMAGE_CHUNK_FRAMES = 512  # frames per zarr chunk for action/lowdim keys
 
 
 def _open_zarr_array(path: str, mode: str, **kwargs) -> zarr.Array:
@@ -43,17 +47,34 @@ def _zarr_append(arr: zarr.Array, data: np.ndarray) -> None:
 
 
 def _jpeg_compressor() -> numcodecs.abc.Codec:
-    """Return best available JPEG compressor, falling back to lz4."""
+    """Return best available JPEG compressor, falling back to lz4.
+
+    Preference order: Jpeg2k (diffusion_policy/imagecodecs) → imagecodecs JPEG
+    → Blosc lz4 (lossless).  Each fallback is logged so lossy/lossless drift
+    between environments is visible.
+    """
     try:
         from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, Jpeg2k
         register_codecs()
         return Jpeg2k(level=50)
-    except Exception:
+    except ImportError:
         pass
     try:
-        return numcodecs.registry.get_codec({"id": "imagecodecs_jpeg", "quality": _JPEG_QUALITY})
-    except Exception:
+        # numcodecs signals an unregistered codec with ValueError, not ImportError.
+        codec = numcodecs.registry.get_codec(
+            {"id": "imagecodecs_jpeg", "quality": _JPEG_QUALITY}
+        )
+        log.warning(
+            "Jpeg2k codec unavailable; using imagecodecs JPEG (lossy, quality=%d) "
+            "for image keys.", _JPEG_QUALITY,
+        )
+        return codec
+    except (ImportError, ValueError):
         pass
+    log.warning(
+        "No JPEG codec available (Jpeg2k / imagecodecs_jpeg); falling back to "
+        "Blosc lz4 (lossless, larger on disk) for image keys."
+    )
     return numcodecs.Blosc(cname="lz4", clevel=1)
 
 
@@ -92,6 +113,7 @@ class ZarrStore(TrajectoryStore):
         from ..schema import schemas_from_meta
         self._schemas = schemas_from_meta(meta)
         self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
+        validate_episode_ends(self._episode_ends, meta.get("n_frames"), path=path)
         self._arrays: Optional[Dict[str, zarr.Array]] = None
         self._open_arrays()
 
@@ -147,6 +169,7 @@ class ZarrStoreWriter(WritableTrajectoryStore):
         self._dtypes: Dict[str, str] = {}
         self._frame_count = 0
         self._finalized = False
+        self._init_contract()
 
     @classmethod
     def create(
@@ -158,7 +181,9 @@ class ZarrStoreWriter(WritableTrajectoryStore):
         schemas=None,
         **kwargs,
     ) -> "ZarrStoreWriter":
-        return cls(path=path, image_keys=image_keys, schemas=schemas)
+        writer = cls(path=path, image_keys=image_keys, schemas=schemas)
+        writer._init_contract(key_shapes, key_dtypes)
+        return writer
 
     @classmethod
     def open_readonly(cls, path: str) -> ZarrStore:
@@ -169,12 +194,17 @@ class ZarrStoreWriter(WritableTrajectoryStore):
             return self._arrays[key]
 
         arr_path = os.path.join(self.path, "data", key)
-        compressor = _jpeg_compressor() if key in self._image_keys else numcodecs.Blosc(cname="lz4", clevel=1)
+        is_image = key in self._image_keys
+        compressor = _jpeg_compressor() if is_image else numcodecs.Blosc(cname="lz4", clevel=1)
+        # Image keys must use chunks=(1, ...) so JPEG-style codecs see a single
+        # image per chunk; lowdim keys use large chunks to avoid per-frame file
+        # overhead in the directory format (same rationale as video.py).
+        chunks = (1,) + frame.shape if is_image else (_NON_IMAGE_CHUNK_FRAMES,) + frame.shape
         arr = _open_zarr_array(
             arr_path,
             mode="w",
             shape=(0,) + frame.shape,
-            chunks=(1,) + frame.shape,
+            chunks=chunks,
             dtype=frame.dtype,
             compressor=compressor,
         )
@@ -185,12 +215,8 @@ class ZarrStoreWriter(WritableTrajectoryStore):
 
     def put_episode(self, data: Dict[str, np.ndarray]) -> None:
         assert not self._finalized, "Cannot write after finalize()"
-        T = None
+        T = self._validate_episode(data, episode_idx=len(self._episode_ends_list))
         for key, arr in data.items():
-            if T is None:
-                T = arr.shape[0]
-            else:
-                assert arr.shape[0] == T, f"Episode length mismatch on key {key!r}"
             _zarr_append(self._get_or_create_array(key, arr[0]), arr)
         self._frame_count += T
         self._episode_ends_list.append(self._frame_count)
@@ -199,6 +225,11 @@ class ZarrStoreWriter(WritableTrajectoryStore):
         from ..schema import schemas_to_meta, validate_schemas_against_shapes
 
         validate_schemas_against_shapes(self._schemas, self._shapes)
+        for key, arr in self._arrays.items():
+            assert arr.shape[0] == self._frame_count, (
+                f"Key {key!r}: stored {arr.shape[0]} frames, expected "
+                f"{self._frame_count} — store is inconsistent."
+            )
         ep_ends = np.array(self._episode_ends_list, dtype=np.int64)
         np.save(os.path.join(self.path, "episode_ends.npy"), ep_ends)
         meta = {

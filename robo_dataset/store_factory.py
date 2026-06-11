@@ -13,10 +13,14 @@ def detect_format(path: str) -> str:
     if os.path.isdir(path):
         if os.path.exists(os.path.join(path, "meta", "info.json")):
             return "lerobot"
+        if os.path.exists(os.path.join(path, "frames.tfrecord")):
+            return "rlds"
         if os.path.exists(os.path.join(path, "meta.json")):
             import json
             with open(os.path.join(path, "meta.json")) as f:
                 meta = json.load(f)
+            if "episode_ends" in meta:
+                return "rlds"  # RLDS keeps episode_ends inline in meta.json
             if "video_keys" in meta:
                 return "video"
             if "shard_frames" in meta:
@@ -35,14 +39,17 @@ def open_store(path: str, format: str = "auto", obs_keys: Optional[list] = None,
 
     Args:
         path:     store root (dir) or HDF5 file.
-        format:   'auto' | 'video' | 'zarr' | 'zarr_sharded' | 'lerobot'
-                  | 'robomimic_hdf5' | 'droid'
+        format:   'auto' | 'video' | 'zarr' | 'zarr_sharded' | 'rlds'
+                  | 'lerobot' | 'robomimic_hdf5' | 'droid'
         obs_keys: required for robomimic_hdf5 (which obs keys to expose).
         kwargs:   forwarded to the backend constructor.
     """
     if format == "auto":
         format = detect_format(path)
 
+    if format == "rlds":
+        from .backends.rlds import RLDSFrameStore
+        return RLDSFrameStore(path, **kwargs)
     if format == "video":
         from .backends.video import VideoStore
         return VideoStore(path, **kwargs)

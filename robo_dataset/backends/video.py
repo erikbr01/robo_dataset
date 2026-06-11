@@ -15,14 +15,21 @@ Write path uses PyAV (libx264 by default) for video keys and zarr lz4
 for non-video keys.
 """
 
+import fractions
 import json
+import logging
 import os
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import numpy as np
 
-from .base import TrajectoryStore, WritableTrajectoryStore
+from .base import (
+    TrajectoryStore,
+    WritableTrajectoryStore,
+    iter_episode_slices,
+    validate_episode_ends,
+)
 from .zarr_backend import _open_zarr_array, _zarr_append
 
 _META_FILE = "meta.json"
@@ -54,13 +61,14 @@ def _pick_decoder_backend() -> str:
     try:
         from torchcodec.decoders import VideoDecoder  # noqa: F401
         _DECODER_BACKEND = "modern"
-    except Exception:
+    except ImportError:
         try:
             from torchcodec.decoders import SimpleVideoDecoder  # noqa: F401
             _DECODER_BACKEND = "legacy"
-        except Exception:
+        except ImportError:
             import av  # noqa: F401  (raise here if neither stack is present)
             _DECODER_BACKEND = "pyav"
+    logging.getLogger(__name__).info("video decode backend: %s", _DECODER_BACKEND)
     return _DECODER_BACKEND
 
 
@@ -116,14 +124,33 @@ class _PyAVDecoder:
         stream = self._stream
         # Seek to the frame's timestamp (backward=True lands on a keyframe ≤ target).
         ts_per_frame = int(round(1 / (stream.average_rate * stream.time_base)))
+        if ts_per_frame < 1:
+            raise ValueError(
+                f"{self._path}: cannot map frame indices to timestamps — "
+                f"ts_per_frame={ts_per_frame} (average_rate={stream.average_rate}, "
+                f"time_base={stream.time_base})."
+            )
         self._container.seek(first * ts_per_frame, stream=stream, backward=True)
         got = {}
+        n_seen = 0
         for frame in self._container.decode(stream):
+            if frame.pts is None:
+                raise ValueError(
+                    f"{self._path}: decoded frame has no pts — cannot map it to "
+                    "a frame index."
+                )
+            n_seen += 1
             idx = int(round(frame.pts / ts_per_frame))
             if idx in want:
                 got[idx] = frame.to_ndarray(format="rgb24")
             if idx >= last:
                 break
+        missing = [i for i in indices if i not in got]
+        if missing:
+            raise ValueError(
+                f"{self._path}: wanted frame indices {sorted(want)} but indices "
+                f"{missing} were never decoded ({n_seen} frames seen after seek)."
+            )
         return np.stack([got[i] for i in indices])
 
 
@@ -184,12 +211,14 @@ class VideoStore(TrajectoryStore):
         from ..schema import schemas_from_meta
         self._schemas = schemas_from_meta(meta)
         self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
+        validate_episode_ends(self._episode_ends, meta.get("n_frames"), path=path)
 
         if max_decoders is None:
             working_set = max(1, len(self._episode_ends) * max(1, len(self._video_keys)))
             max_decoders = min(working_set, _AUTO_MAX_DECODER_CACHE)
         self._max_decoders = max_decoders
         self._decoder_cache = _LRUDecoderCache(maxsize=max_decoders)
+        self._cache_pid = os.getpid()
 
         self._non_video_keys = [k for k in self._keys if k not in self._video_keys]
         self._zarr_arrays: Optional[Dict[str, object]] = None
@@ -206,6 +235,7 @@ class VideoStore(TrajectoryStore):
 
     def on_worker_init(self, worker_id: int) -> None:
         self._decoder_cache.clear()
+        self._cache_pid = os.getpid()
         if self._non_video_keys:
             self._open_zarr_arrays()
 
@@ -228,6 +258,12 @@ class VideoStore(TrajectoryStore):
         return np.dtype(self._dtypes[key])
 
     def _get_decoder(self, key: str, ep_idx: int):
+        # Self-defending fork safety: decoders hold codec/file state that must
+        # not be shared across processes. If we were forked without
+        # on_worker_init(), drop the inherited cache.
+        if os.getpid() != self._cache_pid:
+            self._decoder_cache.clear()
+            self._cache_pid = os.getpid()
         cache_key = (key, ep_idx)
         dec = self._decoder_cache.get(cache_key)
         if dec is None:
@@ -246,26 +282,11 @@ class VideoStore(TrajectoryStore):
         if key not in self._video_keys:
             return self._zarr_arrays[key][start:end]
 
-        ep_start = int(np.searchsorted(self._episode_ends, start, side="right"))
-        ep_last = int(np.searchsorted(self._episode_ends, end - 1, side="right"))
-
-        if ep_start == ep_last:
-            ep_offset = int(self._episode_ends[ep_start - 1]) if ep_start > 0 else 0
-            return self._decode_frames(
-                key, ep_start, list(range(start - ep_offset, end - ep_offset))
-            )
-
-        # Cross-episode: decode each episode's slice and concatenate
-        parts = []
-        for ep_idx in range(ep_start, ep_last + 1):
-            ep_offset = int(self._episode_ends[ep_idx - 1]) if ep_idx > 0 else 0
-            ep_end_global = int(self._episode_ends[ep_idx])
-            local_start = max(start, ep_offset) - ep_offset
-            local_end = min(end, ep_end_global) - ep_offset
-            parts.append(
-                self._decode_frames(key, ep_idx, list(range(local_start, local_end)))
-            )
-        return np.concatenate(parts, axis=0)
+        parts = [
+            self._decode_frames(key, ep_idx, list(range(lo, hi)))
+            for ep_idx, lo, hi in iter_episode_slices(self._episode_ends, start, end)
+        ]
+        return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
 
 
 # ── Write-once store ──────────────────────────────────────────────────────────
@@ -322,6 +343,7 @@ class VideoStoreWriter(WritableTrajectoryStore):
         self._dtypes: Dict[str, str] = {}
         self._frame_count = 0
         self._finalized = False
+        self._init_contract()
 
     @classmethod
     def create(
@@ -339,9 +361,17 @@ class VideoStoreWriter(WritableTrajectoryStore):
         **kwargs,
     ) -> "VideoStoreWriter":
         # image_keys is treated as video_keys for this backend when video_keys not given
+        if image_keys and video_keys and set(image_keys) != set(video_keys):
+            raise ValueError(
+                f"VideoStoreWriter.create: image_keys {sorted(image_keys)} and "
+                f"video_keys {sorted(video_keys)} were both passed but differ — "
+                "pass only one (they are synonyms for this backend)."
+            )
         vk = list(video_keys) if video_keys else list(image_keys)
-        return cls(path=path, video_keys=vk, vcodec=vcodec, crf=crf, kfi=kfi, fps=fps,
-                   schemas=schemas)
+        writer = cls(path=path, video_keys=vk, vcodec=vcodec, crf=crf, kfi=kfi, fps=fps,
+                     schemas=schemas)
+        writer._init_contract(key_shapes, key_dtypes)
+        return writer
 
     @classmethod
     def open_readonly(cls, path: str) -> VideoStore:
@@ -372,7 +402,9 @@ class VideoStoreWriter(WritableTrajectoryStore):
             codec_opts = {"crf": str(self._crf), "g": str(self._kfi)}
         T, H, W = frames.shape[:3]
         c = av_mod.open(mp4_path, "w")
-        s = c.add_stream(self._vcodec, rate=int(self._fps))
+        # Fraction preserves non-integer rates (e.g. 29.97) that int() would truncate.
+        rate = fractions.Fraction(self._fps).limit_denominator(1000)
+        s = c.add_stream(self._vcodec, rate=rate)
         s.width, s.height, s.pix_fmt = W, H, "yuv420p"
         s.options = codec_opts
         for arr in frames:
@@ -384,14 +416,8 @@ class VideoStoreWriter(WritableTrajectoryStore):
 
     def put_episode(self, data: Dict[str, np.ndarray]) -> None:
         assert not self._finalized, "Cannot write after finalize()"
-        T = None
-        for key, arr in data.items():
-            if T is None:
-                T = arr.shape[0]
-            else:
-                assert arr.shape[0] == T, f"Episode length mismatch on key {key!r}"
-
         ep_idx = len(self._episode_ends_list)
+        T = self._validate_episode(data, episode_idx=ep_idx)
         for key, arr in data.items():
             if key not in self._all_keys:
                 self._all_keys.append(key)
@@ -409,6 +435,21 @@ class VideoStoreWriter(WritableTrajectoryStore):
         from ..schema import schemas_to_meta, validate_schemas_against_shapes
 
         validate_schemas_against_shapes(self._schemas, self._shapes)
+        n_episodes = len(self._episode_ends_list)
+        for key, arr in self._zarr_arrays.items():
+            assert arr.shape[0] == self._frame_count, (
+                f"Key {key!r}: stored {arr.shape[0]} frames, expected "
+                f"{self._frame_count} — store is inconsistent."
+            )
+        for key in self._all_keys:
+            if key not in self._video_keys_set:
+                continue
+            vid_dir = os.path.join(self.path, "videos", key)
+            n_files = len([f for f in os.listdir(vid_dir) if f.endswith(".mp4")])
+            assert n_files == n_episodes, (
+                f"Video key {key!r}: {n_files} episode files in {vid_dir!r}, "
+                f"expected {n_episodes} — store is inconsistent."
+            )
         ep_ends = np.array(self._episode_ends_list, dtype=np.int64)
         np.save(os.path.join(self.path, "episode_ends.npy"), ep_ends)
         meta = {

@@ -104,11 +104,15 @@ class RandomCrop(GPUBatchTransform):
                 top = top.repeat_interleave(T)
                 left = left.repeat_interleave(T)
 
-            crops = [
-                flat[i, :, top[i] : top[i] + oh, left[i] : left[i] + ow]
-                for i in range(B * T)
-            ]
-            out[key] = torch.stack(crops).view(B, T, C, oh, ow)
+            # Vectorized gather equivalent to per-element slicing:
+            #   crops[i] = flat[i, :, top[i]:top[i]+oh, left[i]:left[i]+ow]
+            rows = top[:, None] + torch.arange(oh, device=x.device)   # (BT, oh)
+            cols = left[:, None] + torch.arange(ow, device=x.device)  # (BT, ow)
+            bt = torch.arange(B * T, device=x.device)
+            # Advanced indices separated by the channel slice broadcast to the
+            # front: result is (BT, oh, ow, C) — permute back to (BT, C, oh, ow).
+            crops = flat[bt[:, None, None], :, rows[:, :, None], cols[:, None, :]]
+            out[key] = crops.permute(0, 3, 1, 2).contiguous().view(B, T, C, oh, ow)
         return out
 
 

@@ -248,7 +248,8 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
             shard_frames=shard_frames,
             image_keys=image_keys,
             jpeg_level=jpeg_level,
-        , schemas=schemas)
+            schemas=schemas,
+        )
 
     @classmethod
     def open_readonly(cls, path: str) -> ZarrShardedStore:

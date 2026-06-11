@@ -26,7 +26,7 @@ import numpy as np
 import zarr
 from zarr.codecs import ShardingCodec, BytesCodec, BloscCodec
 
-from .base import TrajectoryStore, WritableTrajectoryStore
+from .base import TrajectoryStore, WritableTrajectoryStore, validate_episode_ends
 
 _META_FILE = "meta.json"
 _DEFAULT_CHUNK_FRAMES = 8
@@ -138,9 +138,16 @@ class ZarrShardedStore(TrajectoryStore):
         self._chunk_frames: int = meta.get("chunk_frames", _DEFAULT_CHUNK_FRAMES)
         self._shard_frames: int = meta.get("shard_frames", _DEFAULT_SHARD_FRAMES)
         self._has_jpeg: bool = bool(meta.get("image_keys"))
+        from ..schema import schemas_from_meta
+        self._schemas = schemas_from_meta(meta)
         self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
+        validate_episode_ends(self._episode_ends, meta.get("n_frames"), path=path)
         self._arrays: Optional[Dict[str, zarr.Array]] = None
         self._open_arrays()
+
+    @property
+    def schemas(self):
+        return self._schemas
 
     def _open_arrays(self) -> None:
         if self._has_jpeg:
@@ -202,6 +209,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         shard_frames: int = _DEFAULT_SHARD_FRAMES,
         image_keys: List[str] = (),
         jpeg_level: int = 75,
+        schemas=None,
     ):
         if shard_frames % chunk_frames != 0:
             raise ValueError(
@@ -212,6 +220,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         self._shard_frames = shard_frames
         self._image_keys = set(image_keys)
         self._jpeg_level = jpeg_level
+        self._schemas = dict(schemas or {})
         os.makedirs(os.path.join(path, "data"), exist_ok=True)
 
         self._episode_ends_list: List[int] = []
@@ -220,6 +229,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         self._dtypes: Dict[str, str] = {}
         self._frame_count = 0
         self._finalized = False
+        self._init_contract()
 
     @classmethod
     def create(
@@ -231,15 +241,19 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         shard_frames: int = _DEFAULT_SHARD_FRAMES,
         image_keys: List[str] = (),
         jpeg_level: int = 75,
+        schemas=None,
         **kwargs,
     ) -> "ZarrShardedStoreWriter":
-        return cls(
+        writer = cls(
             path=path,
             chunk_frames=chunk_frames,
             shard_frames=shard_frames,
             image_keys=image_keys,
             jpeg_level=jpeg_level,
+            schemas=schemas,
         )
+        writer._init_contract(key_shapes, key_dtypes)
+        return writer
 
     @classmethod
     def open_readonly(cls, path: str) -> ZarrShardedStore:
@@ -267,12 +281,8 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
 
     def put_episode(self, data: Dict[str, np.ndarray]) -> None:
         assert not self._finalized, "Cannot write after finalize()"
-        T = None
+        T = self._validate_episode(data, episode_idx=len(self._episode_ends_list))
         for key, arr in data.items():
-            if T is None:
-                T = arr.shape[0]
-            else:
-                assert arr.shape[0] == T, f"Episode length mismatch on key {key!r}"
             zarr_arr = self._get_or_create_array(key, arr[0])
             old = zarr_arr.shape[0]
             zarr_arr.resize((old + T,) + tuple(zarr_arr.shape[1:]))
@@ -281,6 +291,13 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         self._episode_ends_list.append(self._frame_count)
 
     def finalize(self) -> None:
+        from ..schema import schemas_to_meta, validate_schemas_against_shapes
+        validate_schemas_against_shapes(self._schemas, self._shapes)
+        for key, arr in self._arrays.items():
+            assert arr.shape[0] == self._frame_count, (
+                f"Key {key!r}: stored {arr.shape[0]} frames, expected "
+                f"{self._frame_count} — store is inconsistent."
+            )
         ep_ends = np.array(self._episode_ends_list, dtype=np.int64)
         np.save(os.path.join(self.path, "episode_ends.npy"), ep_ends)
         meta = {
@@ -293,6 +310,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
             "shard_frames": self._shard_frames,
             "image_keys": sorted(self._image_keys),
             "jpeg_level": self._jpeg_level,
+            "schemas": schemas_to_meta(self._schemas),
         }
         with open(os.path.join(self.path, _META_FILE), "w") as f:
             json.dump(meta, f, indent=2)

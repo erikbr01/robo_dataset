@@ -37,9 +37,19 @@ def _masked_crc32(data: bytes) -> int:
 def _read_record(f, offset: int) -> bytes:
     f.seek(offset)
     len_bytes = f.read(8)
+    if len(len_bytes) != 8:
+        raise ValueError(
+            f"Truncated TFRecord header at byte offset {offset}: got "
+            f"{len(len_bytes)} of 8 length bytes."
+        )
     _len_crc = f.read(4)
     length = struct.unpack("<Q", len_bytes)[0]
     data = f.read(length)
+    if len(data) != length:
+        raise ValueError(
+            f"Truncated TFRecord at byte offset {offset}: record declares "
+            f"{length} bytes but only {len(data)} could be read."
+        )
     _data_crc = f.read(4)
     return data
 
@@ -120,6 +130,13 @@ class RLDSFrameStore(TrajectoryStore):
         self._tfr_path = os.path.join(path, _TFRECORD_FILE)
         with open(os.path.join(path, _INDEX_FILE)) as f:
             self._offsets = np.array([int(l.strip()) for l in f if l.strip()], dtype=np.int64)
+        n_frames = int(self._episode_ends[-1]) if len(self._episode_ends) else 0
+        if len(self._offsets) != n_frames:
+            raise ValueError(
+                f"RLDS store at {path!r}: index has {len(self._offsets)} offsets "
+                f"but episode_ends declares {n_frames} frames — "
+                "store is corrupt/truncated."
+            )
 
         self._local = threading.local()
 
@@ -197,6 +214,23 @@ class RLDSFrameStoreWriter(WritableTrajectoryStore):
         self._shapes: Dict[str, tuple] = {}
         self._dtypes: Dict[str, str] = {}
         self._reader: Optional[RLDSFrameStore] = None
+        self._init_contract()
+
+    def _init_contract(self, key_shapes=None, key_dtypes=None) -> None:
+        # RLDS stores all non-image data as raw float32 bytes; a declared
+        # non-float32 dtype could never round-trip, so refuse it up front.
+        if key_dtypes:
+            bad = {
+                k: str(np.dtype(v)) for k, v in key_dtypes.items()
+                if k not in self.image_keys and np.dtype(v) != np.float32
+            }
+            if bad:
+                raise ValueError(
+                    f"RLDSFrameStoreWriter stores non-image data as float32; "
+                    f"declared non-float32 dtypes are not supported: {bad}. "
+                    "Cast the data (or declare float32) before writing."
+                )
+        super()._init_contract(key_shapes, key_dtypes)
 
     @classmethod
     def create(
@@ -208,6 +242,7 @@ class RLDSFrameStoreWriter(WritableTrajectoryStore):
         **kwargs,
     ) -> "RLDSFrameStoreWriter":
         writer = cls(path=path, image_keys=image_keys, jpeg_quality=kwargs.get("jpeg_quality", 75))
+        writer._init_contract(key_shapes, key_dtypes)
         # Pre-populate shapes/dtypes for non-image keys (image shapes come from first frame)
         for k, shape in key_shapes.items():
             if k not in writer.image_keys:
@@ -230,7 +265,9 @@ class RLDSFrameStoreWriter(WritableTrajectoryStore):
             else:
                 if key not in self._shapes:
                     self._shapes[key] = arr.shape
-                    self._dtypes[key] = str(arr.dtype)
+                # Non-image data is stored (and read back) as float32 — record
+                # that, not the incoming dtype, so meta.json reflects reality.
+                self._dtypes[key] = "float32"
                 features[key] = arr.astype(np.float32).tobytes()
         offset = _write_record(self._f, _make_example(features))
         self._offsets.append(offset)
@@ -238,12 +275,18 @@ class RLDSFrameStoreWriter(WritableTrajectoryStore):
 
     def put_episode(self, data: Dict[str, np.ndarray]) -> None:
         assert self._reader is None, "Cannot write after finalize()"
-        T = next(iter(data.values())).shape[0]
+        T = self._validate_episode(data, episode_idx=len(self._episode_ends_list))
         for t in range(T):
             self._write_frame({k: data[k][t] for k in data})
         self._episode_ends_list.append(self._n_frames)
 
     def finalize(self) -> None:
+        total = self._episode_ends_list[-1] if self._episode_ends_list else 0
+        assert len(self._offsets) == total == self._n_frames, (
+            f"RLDS writer: {len(self._offsets)} record offsets vs "
+            f"{total} frames in episode_ends (n_frames={self._n_frames}) — "
+            "store is inconsistent."
+        )
         self._f.close()
         with open(self._idx_path, "w") as f:
             for offset in self._offsets:
@@ -279,7 +322,7 @@ class RLDSFrameStoreWriter(WritableTrajectoryStore):
         return self._shapes[key]
 
     def frame_dtype(self, key: str) -> np.dtype:
-        return np.dtype(self._dtypes.get(key, "float32"))
+        return np.dtype(self._dtypes[key])
 
     def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
         self._require_finalized()

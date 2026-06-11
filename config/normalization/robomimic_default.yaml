@@ -1,0 +1,20 @@
+# Robomimic/diffusion-policy default normalization (the conventions the
+# legacy replay datasets used) — these are the semantic ROLES a training
+# stack maps onto its actual keys:
+#
+#   abs actions:   pos fields → minmax [-1,1], everything else identity
+#                  (field slices come from the store's VectorSchema)
+#   delta actions: identity (already normalized at collection)
+#   lowdim obs:    one shared max-abs scalar over the concatenated vector
+#   per-key obs:   *_pos / *_qpos → minmax; *_quat → identity
+#   images:        fixed [0,1] → [-1,1] (data-independent)
+action_abs:
+  per_kind: {pos: minmax}
+  default: none
+action_delta: none
+lowdim_obs_concat: max_abs
+obs_pos_like: minmax
+obs_quat_like: none
+image:
+  method: fixed_range
+  in_range: [0.0, 1.0]

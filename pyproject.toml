@@ -6,12 +6,12 @@ build-backend = "hatchling.build"
 name = "robo_dataset"
 version = "0.1.0"
 description = "Unified trajectory dataset for robot learning"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "numpy",
     "torch",
-    "zarr<3.0",
-    "numcodecs<0.13",
+    "zarr>=2.12",
+    "numcodecs",
     "numba",
     "h5py",
     "opencv-python",

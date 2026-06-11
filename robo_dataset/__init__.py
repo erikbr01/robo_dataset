@@ -11,16 +11,14 @@ from .backends import (
     RobomimicHDF5Store,
     ZarrStore,
     ZarrStoreWriter,
-    ZarrShardedStore,
-    ZarrShardedStoreWriter,
-    RLDSFrameStore,
-    RLDSFrameStoreWriter,
     ShmStore,
     VideoStore,
     VideoStoreWriter,
 )
 from .sampler import SequenceSampler, get_val_mask
 from .convert import convert, convert_rlds
+from .schema import Field, VectorSchema
+from .normalization import KeyNormalizer, compute_stats, fit_key, fit_store_normalizers
 
 __all__ = [
     "TrajectoryStore",
@@ -39,6 +37,12 @@ __all__ = [
     "get_val_mask",
     "convert",
     "convert_rlds",
+    "Field",
+    "VectorSchema",
+    "KeyNormalizer",
+    "compute_stats",
+    "fit_key",
+    "fit_store_normalizers",
     "TrajectoryDataset",
 ]
 
@@ -50,4 +54,8 @@ def __getattr__(name):
     if name in ("DataPrefetcher", "CUDADataPrefetcher"):
         from .prefetch import DataPrefetcher
         return DataPrefetcher
+    if name in ("ZarrShardedStore", "ZarrShardedStoreWriter",
+                "RLDSFrameStore", "RLDSFrameStoreWriter"):
+        from . import backends
+        return getattr(backends, name)
     raise AttributeError(f"module 'robo_dataset' has no attribute {name!r}")

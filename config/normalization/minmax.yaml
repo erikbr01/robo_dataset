@@ -1,0 +1,9 @@
+# Uniform 'minmax' normalization for every data-dependent role.
+action_abs: minmax
+action_delta: minmax
+lowdim_obs_concat: minmax
+obs_pos_like: minmax
+obs_quat_like: minmax
+image:
+  method: fixed_range
+  in_range: [0.0, 1.0]

@@ -1,0 +1,9 @@
+# Uniform 'none' normalization for every data-dependent role.
+action_abs: none
+action_delta: none
+lowdim_obs_concat: none
+obs_pos_like: none
+obs_quat_like: none
+image:
+  method: fixed_range
+  in_range: [0.0, 1.0]

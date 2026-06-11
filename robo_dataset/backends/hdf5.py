@@ -8,12 +8,13 @@ Robomimic HDF5 layout:
 Episodes are stored separately; this backend stitches them into a flat view.
 """
 
+import os
 from typing import Dict, List, Optional
 
 import h5py
 import numpy as np
 
-from .base import TrajectoryStore
+from .base import TrajectoryStore, iter_episode_slices
 
 
 class RobomimicHDF5Store(TrajectoryStore):
@@ -33,8 +34,6 @@ class RobomimicHDF5Store(TrajectoryStore):
       separate HDF5 reads, each with its own decompression step.
     - Images are typically stored uncompressed in Robomimic files → large disk footprint.
     - Read-only: no write path (use ZarrStoreWriter or RLDSFrameStoreWriter to convert).
-    - abs_action / rotation_rep parameters create a soft dependency on diffusion_policy
-      for anything other than the default axis_angle representation.
     """
 
     def __init__(
@@ -78,6 +77,7 @@ class RobomimicHDF5Store(TrajectoryStore):
 
         # File handle (opened lazily per worker)
         self._h5file: Optional[h5py.File] = None
+        self._h5file_pid: Optional[int] = None
         self._worker_id: Optional[int] = None
 
     @property
@@ -98,11 +98,17 @@ class RobomimicHDF5Store(TrajectoryStore):
         if self._h5file is not None:
             self._h5file.close()
         self._h5file = h5py.File(self.path, "r")
+        self._h5file_pid = os.getpid()
         self._worker_id = worker_id
 
     def _file(self) -> h5py.File:
+        # Self-defending fork safety: an h5py handle inherited across fork is
+        # unsafe to use; reopen if the pid changed since the handle was opened.
+        if self._h5file is not None and self._h5file_pid != os.getpid():
+            self._h5file = None
         if self._h5file is None:
             self._h5file = h5py.File(self.path, "r")
+            self._h5file_pid = os.getpid()
         return self._h5file
 
     def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
@@ -110,25 +116,15 @@ class RobomimicHDF5Store(TrajectoryStore):
         f = self._file()
         demos = f["data"]
 
-        # Find episodes that overlap [start, end)
-        ep_start_idx = np.searchsorted(self._episode_ends, start, side="right")
-        ep_end_idx = np.searchsorted(self._episode_ends, end - 1, side="right")
-
         parts = []
-        for ep_idx in range(ep_start_idx, ep_end_idx + 1):
-            ep_s = int(self._ep_starts[ep_idx])
-            ep_e = int(self._episode_ends[ep_idx])
-            # Overlap of [start, end) with [ep_s, ep_e)
-            lo = max(start, ep_s) - ep_s
-            hi = min(end, ep_e) - ep_s
+        for ep_idx, lo, hi in iter_episode_slices(self._episode_ends, start, end):
             demo = demos[f"demo_{ep_idx}"]
             if key == "action":
                 arr = demo["actions"][lo:hi].astype(np.float32)
                 if self.abs_action:
                     arr = _convert_actions(arr, self.rotation_rep)
             else:
-                raw = demo["obs"][key][lo:hi]
-                arr = raw[:]  # force load
+                arr = demo["obs"][key][lo:hi]  # h5py slicing yields an ndarray
             parts.append(arr)
 
         return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
@@ -146,8 +142,7 @@ def _convert_actions(raw: np.ndarray, rotation_rep: str) -> np.ndarray:
     if rotation_rep == "axis_angle":
         return raw
 
-    # Deferred import to avoid hard dependency
-    from diffusion_policy.model.common.rotation_transformer import RotationTransformer
+    from robo_dataset.transforms.rotation_transformer import RotationTransformer
     rt = RotationTransformer(from_rep="axis_angle", to_rep=rotation_rep)
 
     is_dual_arm = raw.shape[-1] == 14

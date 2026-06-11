@@ -458,3 +458,102 @@ class TestChannelsLastGPU:
         out = t(batch)
         for key in OBS_KEYS:
             assert out[key].is_contiguous(memory_format=torch.channels_last)
+
+
+class TestRandomCropPerTimestep:
+    def test_per_timestep_offsets_vary(self):
+        import torch
+        from robo_dataset.transforms.gpu_batch import RandomCrop
+        torch.manual_seed(0)
+        t = RandomCrop(image_keys=["img"], size=(8, 8), pad=0, per_timestep=True)
+        # A coordinate ramp makes the crop offset readable from the output.
+        H = W = 32
+        ramp = torch.arange(H * W, dtype=torch.float32).view(1, 1, 1, H, W)
+        batch = {"img": ramp.expand(2, 6, 1, H, W).clone()}
+        out = t(batch)["img"]
+        assert out.shape == (2, 6, 1, 8, 8)
+        # With per-timestep sampling, 12 windows almost surely differ somewhere.
+        corners = {float(out[b, s, 0, 0, 0]) for b in range(2) for s in range(6)}
+        assert len(corners) > 1
+
+    def test_shared_offsets_when_disabled(self):
+        import torch
+        from robo_dataset.transforms.gpu_batch import RandomCrop
+        torch.manual_seed(0)
+        t = RandomCrop(image_keys=["img"], size=(8, 8), pad=0, per_timestep=False)
+        H = W = 32
+        ramp = torch.arange(H * W, dtype=torch.float32).view(1, 1, 1, H, W)
+        batch = {"img": ramp.expand(2, 6, 1, H, W).clone()}
+        out = t(batch)["img"]
+        for b in range(2):
+            corners = {float(out[b, s, 0, 0, 0]) for s in range(6)}
+            assert len(corners) == 1, "offsets must be shared across timesteps"
+
+
+def _random_crop_loop_reference(x, size, pad, per_timestep):
+    """The pre-vectorization RandomCrop loop, kept verbatim as RNG-semantics
+    reference: same torch.randint calls in the same order and shapes."""
+    import torch.nn.functional as F
+    B, T, C, H, W = x.shape
+    oh, ow = size
+    flat = x.view(B * T, C, H, W)
+    if pad > 0:
+        flat = F.pad(flat, [pad] * 4, mode="reflect")
+    PH, PW = H + 2 * pad, W + 2 * pad
+    n_offsets = B * T if per_timestep else B
+    top = torch.randint(0, PH - oh + 1, (n_offsets,), device=x.device)
+    left = torch.randint(0, PW - ow + 1, (n_offsets,), device=x.device)
+    if not per_timestep:
+        top = top.repeat_interleave(T)
+        left = left.repeat_interleave(T)
+    crops = [
+        flat[i, :, top[i] : top[i] + oh, left[i] : left[i] + ow]
+        for i in range(B * T)
+    ]
+    return torch.stack(crops).view(B, T, C, oh, ow)
+
+
+class TestRandomCropVectorizedEquivalence:
+    """The vectorized RandomCrop must be bit-identical to the original
+    per-element loop for a fixed seed (same RNG draws, same crops)."""
+
+    @pytest.mark.parametrize("per_timestep", [False, True])
+    @pytest.mark.parametrize("pad", [0, 4])
+    def test_matches_loop_reference(self, per_timestep, pad):
+        from robo_dataset.transforms.gpu_batch import RandomCrop
+        x = torch.randn(3, 5, 2, 20, 24)
+
+        torch.manual_seed(1234)
+        expected = _random_crop_loop_reference(
+            x, size=(12, 14), pad=pad, per_timestep=per_timestep
+        )
+
+        torch.manual_seed(1234)
+        crop = RandomCrop(
+            image_keys=["img"], size=(12, 14), pad=pad, per_timestep=per_timestep
+        )
+        got = crop({"img": x})["img"]
+
+        assert got.shape == expected.shape
+        assert torch.equal(got, expected)
+
+
+class TestCenterCrop:
+    def test_center_crop_values(self):
+        import torch
+        from robo_dataset.transforms.gpu_batch import CenterCrop
+        t = CenterCrop(image_keys=["img"], size=(8, 8))
+        H = W = 12
+        x = torch.arange(H * W, dtype=torch.float32).view(1, 1, 1, H, W)
+        out = t({"img": x})["img"]
+        assert out.shape == (1, 1, 1, 8, 8)
+        # top-left of center crop = (2, 2)
+        assert float(out[0, 0, 0, 0, 0]) == float(x[0, 0, 0, 2, 2])
+
+    def test_noop_at_target_size(self):
+        import torch
+        from robo_dataset.transforms.gpu_batch import CenterCrop
+        t = CenterCrop(image_keys=["img"], size=(8, 8))
+        x = torch.randn(2, 3, 1, 8, 8)
+        out = t({"img": x})["img"]
+        assert out is x

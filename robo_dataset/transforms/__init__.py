@@ -7,7 +7,7 @@ from .base import (
 )
 from .disk_cached import ResizeImages, apply_disk_cached
 from .cpu_batch import SplitObsAction, ImageToTensor, NormalizeRange, ComposeCPU, make_collate_fn
-from .gpu_batch import RandomCrop, ColorJitter, ChannelsLastGPU, ComposeGPU, ImageToTensorDevice, ImageToTensorGPU
+from .gpu_batch import RandomCrop, CenterCrop, ColorJitter, ChannelsLastGPU, ComposeGPU, ImageToTensorDevice, ImageToTensorGPU
 from .rotation_transformer import (
     RotationTransformer,
     axis_angle_to_matrix,
@@ -33,6 +33,7 @@ __all__ = [
     "ComposeCPU",
     "make_collate_fn",
     "RandomCrop",
+    "CenterCrop",
     "ColorJitter",
     "ChannelsLastGPU",
     "ComposeGPU",

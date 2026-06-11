@@ -85,11 +85,39 @@ class _ModernDecoder:
 
 
 class _LegacyDecoder:
-    """torchcodec 0.0.3: SimpleVideoDecoder with range-based batch API."""
+    """torchcodec 0.0.3: SimpleVideoDecoder with range-based batch API.
+
+    The decoder stream is added through the core API with num_threads=1:
+    SimpleVideoDecoder's default lets ffmpeg auto-thread (up to nproc threads
+    PER DECODER), which exhausts the process/thread limit once many workers
+    each hold a large decoder cache (observed as
+    "ValueError: Resource temporarily unavailable" at 16 workers × ~600
+    cached decoders on a 32-core box). Single-frame robot-cam decodes gain
+    nothing from intra-frame threading.
+    """
 
     def __init__(self, path: str):
         from torchcodec.decoders import SimpleVideoDecoder
-        self._dec = SimpleVideoDecoder(path)
+        from torchcodec.decoders import _core as core
+        from torchcodec.decoders._simple_video_decoder import (
+            _get_and_validate_stream_metadata,
+        )
+
+        # Replicates SimpleVideoDecoder.__init__(path, "NCHW") with the one
+        # change the public API does not expose: num_threads=1.
+        dec = SimpleVideoDecoder.__new__(SimpleVideoDecoder)
+        dec._decoder = core.create_from_file(path)
+        core.scan_all_streams_to_update_metadata(dec._decoder)
+        core.add_video_stream(dec._decoder, dimension_order="NCHW", num_threads=1)
+        dec.metadata, dec._stream_index = _get_and_validate_stream_metadata(dec._decoder)
+        if dec.metadata.num_frames_from_content is None:
+            raise ValueError(f"Unknown frame count in {path!r}")
+        dec._num_frames = dec.metadata.num_frames_from_content
+        if dec.metadata.begin_stream_seconds is None or dec.metadata.end_stream_seconds is None:
+            raise ValueError(f"Unknown stream pts bounds in {path!r}")
+        dec._begin_stream_seconds = dec.metadata.begin_stream_seconds
+        dec._end_stream_seconds = dec.metadata.end_stream_seconds
+        self._dec = dec
 
     def get_frames(self, indices: List[int]) -> np.ndarray:
         contiguous = len(indices) <= 1 or all(

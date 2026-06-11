@@ -41,6 +41,17 @@ class TrajectoryStore(ABC):
     def on_worker_init(self, worker_id: int) -> None:
         """Called once per DataLoader worker after fork. Override to reopen file handles."""
 
+    @property
+    def schemas(self) -> Dict[str, "VectorSchema"]:  # noqa: F821
+        """Vector field schemas per key (see robo_dataset.schema).
+
+        Self-describing stores (written with ``schemas=``, or backends that
+        know their layout) return one VectorSchema per vector-valued key;
+        consumers should validate their expectations against these instead of
+        hardcoding index ranges. Default: empty (no schema information).
+        """
+        return {}
+
     # ── Derived helpers ───────────────────────────────────────────────────────
 
     @property

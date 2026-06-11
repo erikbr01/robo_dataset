@@ -17,6 +17,7 @@ from .backends import (
 )
 from .sampler import SequenceSampler, get_val_mask
 from .convert import convert, convert_rlds
+from .schema import Field, VectorSchema
 
 __all__ = [
     "TrajectoryStore",
@@ -35,6 +36,8 @@ __all__ = [
     "get_val_mask",
     "convert",
     "convert_rlds",
+    "Field",
+    "VectorSchema",
     "TrajectoryDataset",
 ]
 

@@ -181,6 +181,8 @@ class VideoStore(TrajectoryStore):
         self._dtypes: Dict[str, str] = meta["dtypes"]
         self._video_keys: List[str] = meta.get("video_keys", [])
         self._fps: float = float(meta.get("fps", _DEFAULT_FPS))
+        from ..schema import schemas_from_meta
+        self._schemas = schemas_from_meta(meta)
         self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
 
         if max_decoders is None:
@@ -214,6 +216,10 @@ class VideoStore(TrajectoryStore):
     @property
     def keys(self) -> List[str]:
         return self._keys
+
+    @property
+    def schemas(self):
+        return self._schemas
 
     def frame_shape(self, key: str) -> tuple:
         return self._shapes[key]
@@ -294,10 +300,12 @@ class VideoStoreWriter(WritableTrajectoryStore):
         crf: int = _DEFAULT_CRF,
         kfi: int = _DEFAULT_KFI,
         fps: float = _DEFAULT_FPS,
+        schemas=None,
     ):
         self.path = path
         self._video_keys_set = set(video_keys)
         self._video_keys_ordered = list(video_keys)
+        self._schemas = dict(schemas or {})
         self._vcodec = vcodec
         self._crf = crf
         self._kfi = kfi
@@ -327,11 +335,13 @@ class VideoStoreWriter(WritableTrajectoryStore):
         crf: int = _DEFAULT_CRF,
         kfi: int = _DEFAULT_KFI,
         fps: float = _DEFAULT_FPS,
+        schemas=None,
         **kwargs,
     ) -> "VideoStoreWriter":
         # image_keys is treated as video_keys for this backend when video_keys not given
         vk = list(video_keys) if video_keys else list(image_keys)
-        return cls(path=path, video_keys=vk, vcodec=vcodec, crf=crf, kfi=kfi, fps=fps)
+        return cls(path=path, video_keys=vk, vcodec=vcodec, crf=crf, kfi=kfi, fps=fps,
+                   schemas=schemas)
 
     @classmethod
     def open_readonly(cls, path: str) -> VideoStore:
@@ -396,6 +406,9 @@ class VideoStoreWriter(WritableTrajectoryStore):
         self._episode_ends_list.append(self._frame_count)
 
     def finalize(self) -> None:
+        from ..schema import schemas_to_meta, validate_schemas_against_shapes
+
+        validate_schemas_against_shapes(self._schemas, self._shapes)
         ep_ends = np.array(self._episode_ends_list, dtype=np.int64)
         np.save(os.path.join(self.path, "episode_ends.npy"), ep_ends)
         meta = {
@@ -409,6 +422,7 @@ class VideoStoreWriter(WritableTrajectoryStore):
             "crf": self._crf,
             "kfi": self._kfi,
             "fps": self._fps,
+            "schemas": schemas_to_meta(self._schemas),
         }
         with open(os.path.join(self.path, _META_FILE), "w") as f:
             json.dump(meta, f, indent=2)

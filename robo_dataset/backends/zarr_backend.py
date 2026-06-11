@@ -89,9 +89,15 @@ class ZarrStore(TrajectoryStore):
         self._keys: List[str] = meta["keys"]
         self._shapes: Dict[str, tuple] = {k: tuple(v) for k, v in meta["shapes"].items()}
         self._dtypes: Dict[str, str] = meta["dtypes"]
+        from ..schema import schemas_from_meta
+        self._schemas = schemas_from_meta(meta)
         self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
         self._arrays: Optional[Dict[str, zarr.Array]] = None
         self._open_arrays()
+
+    @property
+    def schemas(self):
+        return self._schemas
 
     def _open_arrays(self) -> None:
         self._arrays = {}
@@ -129,9 +135,10 @@ class ZarrStoreWriter(WritableTrajectoryStore):
     Same pros/cons as ZarrStore apply after finalize().
     """
 
-    def __init__(self, path: str, image_keys: List[str] = ()):
+    def __init__(self, path: str, image_keys: List[str] = (), schemas=None):
         self.path = path
         self._image_keys = set(image_keys)
+        self._schemas = dict(schemas or {})
         os.makedirs(os.path.join(path, "data"), exist_ok=True)
 
         self._episode_ends_list: List[int] = []
@@ -148,9 +155,10 @@ class ZarrStoreWriter(WritableTrajectoryStore):
         key_shapes: Dict[str, tuple],
         key_dtypes: Dict[str, np.dtype],
         image_keys: List[str] = (),
+        schemas=None,
         **kwargs,
     ) -> "ZarrStoreWriter":
-        return cls(path=path, image_keys=image_keys)
+        return cls(path=path, image_keys=image_keys, schemas=schemas)
 
     @classmethod
     def open_readonly(cls, path: str) -> ZarrStore:
@@ -188,6 +196,9 @@ class ZarrStoreWriter(WritableTrajectoryStore):
         self._episode_ends_list.append(self._frame_count)
 
     def finalize(self) -> None:
+        from ..schema import schemas_to_meta, validate_schemas_against_shapes
+
+        validate_schemas_against_shapes(self._schemas, self._shapes)
         ep_ends = np.array(self._episode_ends_list, dtype=np.int64)
         np.save(os.path.join(self.path, "episode_ends.npy"), ep_ends)
         meta = {
@@ -196,6 +207,7 @@ class ZarrStoreWriter(WritableTrajectoryStore):
             "dtypes": self._dtypes,
             "n_episodes": len(self._episode_ends_list),
             "n_frames": self._frame_count,
+            "schemas": schemas_to_meta(self._schemas),
         }
         with open(os.path.join(self.path, _META_FILE), "w") as f:
             json.dump(meta, f, indent=2)

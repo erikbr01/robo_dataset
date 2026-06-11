@@ -138,9 +138,15 @@ class ZarrShardedStore(TrajectoryStore):
         self._chunk_frames: int = meta.get("chunk_frames", _DEFAULT_CHUNK_FRAMES)
         self._shard_frames: int = meta.get("shard_frames", _DEFAULT_SHARD_FRAMES)
         self._has_jpeg: bool = bool(meta.get("image_keys"))
+        from ..schema import schemas_from_meta
+        self._schemas = schemas_from_meta(meta)
         self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
         self._arrays: Optional[Dict[str, zarr.Array]] = None
         self._open_arrays()
+
+    @property
+    def schemas(self):
+        return self._schemas
 
     def _open_arrays(self) -> None:
         if self._has_jpeg:
@@ -202,6 +208,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         shard_frames: int = _DEFAULT_SHARD_FRAMES,
         image_keys: List[str] = (),
         jpeg_level: int = 75,
+        schemas=None,
     ):
         if shard_frames % chunk_frames != 0:
             raise ValueError(
@@ -212,6 +219,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         self._shard_frames = shard_frames
         self._image_keys = set(image_keys)
         self._jpeg_level = jpeg_level
+        self._schemas = dict(schemas or {})
         os.makedirs(os.path.join(path, "data"), exist_ok=True)
 
         self._episode_ends_list: List[int] = []
@@ -231,6 +239,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         shard_frames: int = _DEFAULT_SHARD_FRAMES,
         image_keys: List[str] = (),
         jpeg_level: int = 75,
+        schemas=None,
         **kwargs,
     ) -> "ZarrShardedStoreWriter":
         return cls(
@@ -239,7 +248,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
             shard_frames=shard_frames,
             image_keys=image_keys,
             jpeg_level=jpeg_level,
-        )
+        , schemas=schemas)
 
     @classmethod
     def open_readonly(cls, path: str) -> ZarrShardedStore:
@@ -281,6 +290,8 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
         self._episode_ends_list.append(self._frame_count)
 
     def finalize(self) -> None:
+        from ..schema import schemas_to_meta, validate_schemas_against_shapes
+        validate_schemas_against_shapes(self._schemas, self._shapes)
         ep_ends = np.array(self._episode_ends_list, dtype=np.int64)
         np.save(os.path.join(self.path, "episode_ends.npy"), ep_ends)
         meta = {
@@ -293,6 +304,7 @@ class ZarrShardedStoreWriter(WritableTrajectoryStore):
             "shard_frames": self._shard_frames,
             "image_keys": sorted(self._image_keys),
             "jpeg_level": self._jpeg_level,
+            "schemas": schemas_to_meta(self._schemas),
         }
         with open(os.path.join(self.path, _META_FILE), "w") as f:
             json.dump(meta, f, indent=2)

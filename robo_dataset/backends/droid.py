@@ -127,6 +127,32 @@ class DroidStore(TrajectoryStore):
         self._keys = list(self._shapes)
         self._episode_cache: OrderedDict = OrderedDict()
 
+        # DROID layouts are fixed — describe them so converted stores are
+        # self-describing (see robo_dataset.schema).
+        from ..schema import Field, VectorSchema
+        arm_kind, arm_rep = (
+            ("joints", "velocity") if "velocity" in self.action_space else
+            ("joints", "abs") if "joint" in self.action_space else
+            ("generic", None)
+        )
+        self._schemas = {
+            "action": VectorSchema((
+                Field(self.action_space, 7, arm_kind, arm_rep),
+                Field("gripper", 1, "gripper", "continuous"),
+            )),
+            "joint_positions": VectorSchema((Field("joints", 7, "joints", "abs"),)),
+            # DROID cartesian_position is xyz + euler
+            "cartesian_position": VectorSchema((
+                Field("pos", 3, "pos", "abs"),
+                Field("rot", 3, "rot", "euler"),
+            )),
+            "gripper_position": VectorSchema((Field("gripper", 1, "gripper", "continuous"),)),
+        }
+
+    @property
+    def schemas(self):
+        return self._schemas
+
     # ── lowdim (direct trajectory.h5 read, movement-mask filtered) ───────────
 
     def _load_lowdim(self, session: str) -> Dict[str, np.ndarray]:

@@ -119,8 +119,35 @@ class LeRobotStore(TrajectoryStore):
 
         self._keys = list(self._video_key_map) + list(self._parquet_key_map)
 
+        # Best-effort schemas from modality.json: each named span of a full
+        # parquet vector column becomes a field (kind generic — the modality
+        # file does not carry representations).
+        from ..schema import Field, VectorSchema
+        self._schemas: Dict[str, VectorSchema] = {}
+        if self._modality is not None:
+            for group, col_default in (("state", "observation.state"), ("action", "action")):
+                spans = [
+                    (name, spec) for name, spec in self._modality.get(group, {}).items()
+                    if spec["original_key"] in self._parquet_key_map
+                ]
+                spans.sort(key=lambda x: int(x[1]["start"]))
+                if spans:
+                    col = spans[0][1]["original_key"]
+                    fields = tuple(
+                        Field(name, int(s["end"]) - int(s["start"]), "generic")
+                        for name, s in spans
+                    )
+                    schema = VectorSchema(fields)
+                    col_dim = self._shapes.get(col, (None,))[0]
+                    if col_dim == schema.dim:
+                        self._schemas[col] = schema
+
         self._decoder_cache = _LRUDecoderCache(maxsize=max_decoders)
         self._episode_cache: OrderedDict = OrderedDict()  # ep_idx → {col: ndarray}
+
+    @property
+    def schemas(self):
+        return self._schemas
 
     @staticmethod
     def _video_shape(attr: dict) -> Tuple[int, int, int]:

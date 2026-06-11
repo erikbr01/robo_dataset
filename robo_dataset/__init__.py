@@ -18,6 +18,7 @@ from .backends import (
 from .sampler import SequenceSampler, get_val_mask
 from .convert import convert, convert_rlds
 from .schema import Field, VectorSchema
+from .normalization import KeyNormalizer, compute_stats, fit_key, fit_store_normalizers
 
 __all__ = [
     "TrajectoryStore",
@@ -38,6 +39,10 @@ __all__ = [
     "convert_rlds",
     "Field",
     "VectorSchema",
+    "KeyNormalizer",
+    "compute_stats",
+    "fit_key",
+    "fit_store_normalizers",
     "TrajectoryDataset",
 ]
 

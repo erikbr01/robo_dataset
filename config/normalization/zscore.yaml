@@ -1,0 +1,9 @@
+# Uniform 'zscore' normalization for every data-dependent role.
+action_abs: zscore
+action_delta: zscore
+lowdim_obs_concat: zscore
+obs_pos_like: zscore
+obs_quat_like: zscore
+image:
+  method: fixed_range
+  in_range: [0.0, 1.0]

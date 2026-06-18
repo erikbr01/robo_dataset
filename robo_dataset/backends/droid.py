@@ -379,11 +379,13 @@ class DroidStore(TrajectoryStore):
         return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
 
     def iter_episodes(self) -> Iterator[Dict[str, np.ndarray]]:
+        self._yielded_sessions: list[str] = []
         for ep_idx in range(self.n_episodes):
             start = self.episode_start(ep_idx)
             end = int(self.episode_ends[ep_idx])
             try:
                 yield {key: self.get_sequence(key, start, end) for key in self.keys}
+                self._yielded_sessions.append(self.sessions[ep_idx])
             except (ValueError, RuntimeError, FileNotFoundError) as exc:
                 if not self._skip_corrupt:
                     raise

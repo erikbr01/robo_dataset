@@ -38,14 +38,17 @@ fine for conversion (sequential) and clustering; for high-throughput training
 convert to a VideoStore first.
 """
 
+import logging
 import os
 import sys
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import numpy as np
 
 from .base import TrajectoryStore, iter_episode_slices
+
+_log = logging.getLogger(__name__)
 
 _EPISODE_CACHE_SIZE = 2
 _LOWDIM_KEYS = {
@@ -69,6 +72,9 @@ class DroidStore(TrajectoryStore):
         max_episodes: Optional[int] = None,
         droid_package_path: str = "~/src_droid",
         zed_settings_path: Optional[str] = None,
+        skip_empty: bool = False,
+        skip_corrupt: bool = False,
+        session_offset: int = 0,
     ):
         if camera_source not in ("none", "svo", "mp4"):
             raise ValueError(f"camera_source must be none|svo|mp4, got {camera_source!r}")
@@ -84,6 +90,9 @@ class DroidStore(TrajectoryStore):
         # Dir with per-camera ZED calibration files (SN<serial>.conf); without
         # it, offline SVO decode fails with CALIBRATION FILE NOT AVAILABLE.
         self.zed_settings_path = zed_settings_path
+        self._skip_empty = skip_empty
+        self._skip_corrupt = skip_corrupt
+        self._session_offset = session_offset
 
         # Discover session folders (any dir containing trajectory.h5).
         sessions: List[str] = []
@@ -91,6 +100,8 @@ class DroidStore(TrajectoryStore):
             if "trajectory.h5" in files:
                 sessions.append(root)
         sessions.sort()
+        if session_offset:
+            sessions = sessions[session_offset:]
         if max_episodes is not None:
             sessions = sessions[:max_episodes]
         if not sessions:
@@ -99,6 +110,7 @@ class DroidStore(TrajectoryStore):
         # Episode lengths from the movement mask — no camera decode needed.
         import h5py
         lengths = []
+        kept_sessions = []
         for s in sessions:
             with h5py.File(os.path.join(s, "trajectory.h5"), "r") as f:
                 if _MOVEMENT_KEY in f:
@@ -106,11 +118,15 @@ class DroidStore(TrajectoryStore):
                 else:
                     T = int(f[f"action/{self.action_space}"].shape[0])
             if T == 0:
+                if self._skip_empty:
+                    _log.warning("skipping zero-step session: %s", s)
+                    continue
                 raise ValueError(
                     f"Session {s!r} has zero kept steps — exclude it explicitly."
                 )
             lengths.append(T)
-        self.sessions = sessions
+            kept_sessions.append(s)
+        self.sessions = kept_sessions
         self._episode_ends = np.cumsum(lengths).astype(np.int64)
 
         self._shapes: Dict[str, tuple] = dict(_LOWDIM_KEYS)
@@ -361,3 +377,17 @@ class DroidStore(TrajectoryStore):
             for ep_idx, lo, hi in iter_episode_slices(self._episode_ends, start, end)
         ]
         return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+
+    def iter_episodes(self) -> Iterator[Dict[str, np.ndarray]]:
+        for ep_idx in range(self.n_episodes):
+            start = self.episode_start(ep_idx)
+            end = int(self.episode_ends[ep_idx])
+            try:
+                yield {key: self.get_sequence(key, start, end) for key in self.keys}
+            except (ValueError, RuntimeError, FileNotFoundError) as exc:
+                if not self._skip_corrupt:
+                    raise
+                _log.warning(
+                    "skipping corrupt episode %d (%s): %s",
+                    ep_idx, self.sessions[ep_idx], exc,
+                )

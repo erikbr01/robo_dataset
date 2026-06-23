@@ -146,6 +146,11 @@ class ZarrStore(TrajectoryStore):
     def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
         return self._arrays[key][start:end]
 
+    def get_frames(self, ep_idx: int, key: str, start: int, end: int) -> np.ndarray:
+        """Native episode-indexed read: translate local indices to flat and slice."""
+        ep_start = self.episode_start(ep_idx)
+        return self._arrays[key][ep_start + start : ep_start + end]
+
 
 # ── Write-once store ──────────────────────────────────────────────────────────
 

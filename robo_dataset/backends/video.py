@@ -1,10 +1,12 @@
 """Per-episode MP4 video backend (read + write).
 
-Layout on disk:
-  <path>/videos/<key>/episode_XXXXXX.mp4  one MP4 per episode per video key
-  <path>/data/<key>/                       zarr lz4 arrays for non-video keys
-  <path>/episode_ends.npy                  int64 episode boundary array
-  <path>/meta.json                         keys, shapes, dtypes, video_keys, codec params
+Layout on disk (new format):
+  <path>/videos/<key>/episode_XXXXXX.mp4   one MP4 per episode per video key
+  <path>/data/<ep_idx:06d>/<key>           zarr lz4 arrays for non-video keys
+  <path>/meta.json                         keys, shapes, dtypes, video_keys, codec params, n_episodes
+
+Old format (episode_ends.npy present) is detected and read transparently for
+backward compatibility.  New stores written by VideoStoreWriter use the new layout.
 
 Read path uses torchcodec VideoDecoder with seek_mode='approximate'.
 Decoders are cached per (key, episode_idx) per worker with an LRU cap
@@ -25,6 +27,8 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .base import (
+    EpisodeStore,
+    WritableEpisodeStore,
     TrajectoryStore,
     WritableTrajectoryStore,
     iter_episode_slices,
@@ -83,6 +87,9 @@ class _ModernDecoder:
         result = self._dec.get_frames_at(indices=indices)
         return result.data.permute(0, 2, 3, 1).numpy()
 
+    def n_frames(self) -> int:
+        return len(self._dec)
+
 
 class _LegacyDecoder:
     """torchcodec 0.0.3: SimpleVideoDecoder with range-based batch API.
@@ -129,6 +136,9 @@ class _LegacyDecoder:
         frames = [self._dec.get_frame_at(i).data for i in indices]
         import torch
         return torch.stack(frames).permute(0, 2, 3, 1).numpy()
+
+    def n_frames(self) -> int:
+        return self._dec._num_frames
 
 
 class _PyAVDecoder:
@@ -181,6 +191,9 @@ class _PyAVDecoder:
             )
         return np.stack([got[i] for i in indices])
 
+    def n_frames(self) -> int:
+        return self._stream.frames
+
 
 _DECODER_CLS = {"modern": _ModernDecoder, "legacy": _LegacyDecoder, "pyav": _PyAVDecoder}
 
@@ -210,12 +223,15 @@ class _LRUDecoderCache:
 
 # ── Read-only store ───────────────────────────────────────────────────────────
 
-class VideoStore(TrajectoryStore):
+class VideoStore(EpisodeStore):
     """Read-only view of a per-episode MP4 video dataset.
 
     Video keys are stored as one MP4 per episode per key; non-video keys
     are stored as zarr lz4 arrays.  Uses torchcodec VideoDecoder with
     seek_mode='approximate' and a bounded LRU decoder cache per worker.
+
+    Supports both the new layout (per-episode zarr dirs under data/<ep_idx:06d>/)
+    and the old layout (flat zarr arrays under data/<key>/ with episode_ends.npy).
 
     max_decoders sizes the per-worker LRU decoder cache. The default (None)
     auto-sizes to n_episodes × n_video_keys (capped at 1024) — under uniform
@@ -238,22 +254,39 @@ class VideoStore(TrajectoryStore):
         self._fps: float = float(meta.get("fps", _DEFAULT_FPS))
         from ..schema import schemas_from_meta
         self._schemas = schemas_from_meta(meta)
-        self._episode_ends = np.load(os.path.join(path, "episode_ends.npy"))
-        validate_episode_ends(self._episode_ends, meta.get("n_frames"), path=path)
+
+        # Detect old layout: episode_ends.npy exists → old format
+        ep_ends_path = os.path.join(path, "episode_ends.npy")
+        self._old_format = os.path.exists(ep_ends_path)
+
+        if self._old_format:
+            self._episode_ends = np.load(ep_ends_path)
+            validate_episode_ends(self._episode_ends, meta.get("n_frames"), path=path)
+            self._n_episodes = len(self._episode_ends)
+        else:
+            self._n_episodes = int(meta["n_episodes"])
+            # lengths loaded below after decoder cache init
+            self._lengths: Optional[List[int]] = None
 
         if max_decoders is None:
-            working_set = max(1, len(self._episode_ends) * max(1, len(self._video_keys)))
+            working_set = max(1, self._n_episodes * max(1, len(self._video_keys)))
             max_decoders = min(working_set, _AUTO_MAX_DECODER_CACHE)
         self._max_decoders = max_decoders
         self._decoder_cache = _LRUDecoderCache(maxsize=max_decoders)
         self._cache_pid = os.getpid()
 
         self._non_video_keys = [k for k in self._keys if k not in self._video_keys]
-        self._zarr_arrays: Optional[Dict[str, object]] = None
-        if self._non_video_keys:
-            self._open_zarr_arrays()
 
-    def _open_zarr_arrays(self) -> None:
+        if self._old_format:
+            self._zarr_arrays: Optional[Dict[str, object]] = None
+            if self._non_video_keys:
+                self._open_zarr_arrays_flat()
+        else:
+            # New format: load episode lengths from MP4 frame counts or zarr shapes
+            self._load_lengths()
+
+    def _open_zarr_arrays_flat(self) -> None:
+        """Old format: flat zarr arrays under data/<key>/."""
         import zarr
         self._zarr_arrays = {}
         for key in self._non_video_keys:
@@ -261,15 +294,52 @@ class VideoStore(TrajectoryStore):
                 os.path.join(self.path, "data", key), mode="r"
             )
 
+    def _load_lengths(self) -> None:
+        """New format: read episode lengths from first video key's frame count
+        (or first non-video key's zarr array shape if no video keys)."""
+        lengths = []
+        if self._video_keys:
+            first_vk = self._video_keys[0]
+            for ep_idx in range(self._n_episodes):
+                mp4_path = os.path.join(
+                    self.path, "videos", first_vk, f"episode_{ep_idx:06d}.mp4"
+                )
+                dec = _DECODER_CLS[_pick_decoder_backend()](mp4_path)
+                lengths.append(dec.n_frames())
+        elif self._non_video_keys:
+            import zarr
+            first_nk = self._non_video_keys[0]
+            for ep_idx in range(self._n_episodes):
+                arr_path = os.path.join(self.path, "data", f"{ep_idx:06d}", first_nk)
+                arr = zarr.open(arr_path, mode="r")
+                lengths.append(int(arr.shape[0]))
+        else:
+            lengths = [0] * self._n_episodes
+        self._lengths = lengths
+
     def on_worker_init(self, worker_id: int) -> None:
         self._decoder_cache.clear()
         self._cache_pid = os.getpid()
-        if self._non_video_keys:
-            self._open_zarr_arrays()
+        if self._old_format:
+            if self._non_video_keys:
+                self._open_zarr_arrays_flat()
+        else:
+            self._load_lengths()
+
+    # ── EpisodeStore interface ────────────────────────────────────────────────
+
+    @property
+    def n_episodes(self) -> int:
+        return self._n_episodes
 
     @property
     def episode_ends(self) -> np.ndarray:
-        return self._episode_ends
+        """Derived from episode_length() — or from stored array for old format."""
+        if self._old_format:
+            return self._episode_ends
+        # New format: derive from cached lengths
+        ends = np.array(self._lengths, dtype=np.int64)
+        return np.cumsum(ends)
 
     @property
     def keys(self) -> List[str]:
@@ -284,6 +354,13 @@ class VideoStore(TrajectoryStore):
 
     def frame_dtype(self, key: str) -> np.dtype:
         return np.dtype(self._dtypes[key])
+
+    def episode_length(self, ep_idx: int) -> int:
+        if self._old_format:
+            return int(self._episode_ends[ep_idx]) - (
+                0 if ep_idx == 0 else int(self._episode_ends[ep_idx - 1])
+            )
+        return self._lengths[ep_idx]
 
     def _get_decoder(self, key: str, ep_idx: int):
         # Self-defending fork safety: decoders hold codec/file state that must
@@ -306,29 +383,54 @@ class VideoStore(TrajectoryStore):
         # (N, H, W, C) uint8
         return self._get_decoder(key, ep_idx).get_frames(local_indices)
 
+    def get_frames(self, ep_idx: int, key: str, start: int, end: int) -> np.ndarray:
+        """Read frames [start, end) from episode ep_idx for a single key."""
+        if key in self._video_keys:
+            return self._decode_frames(key, ep_idx, list(range(start, end)))
+        # Non-video key
+        if self._old_format:
+            # Old format: flat zarr array — translate to flat indices
+            ep_start = 0 if ep_idx == 0 else int(self._episode_ends[ep_idx - 1])
+            return self._zarr_arrays[key][ep_start + start : ep_start + end]
+        else:
+            # New format: per-episode zarr directory
+            import zarr
+            arr_path = os.path.join(self.path, "data", f"{ep_idx:06d}", key)
+            arr = zarr.open(arr_path, mode="r")
+            return arr[start:end]
+
     def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
-        if key not in self._video_keys:
-            return self._zarr_arrays[key][start:end]
+        """Backward-compat flat-index access."""
+        if self._old_format:
+            if key not in self._video_keys:
+                return self._zarr_arrays[key][start:end]
+            parts = [
+                self._decode_frames(key, ep_idx, list(range(lo, hi)))
+                for ep_idx, lo, hi in iter_episode_slices(self._episode_ends, start, end)
+            ]
+            return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+        else:
+            # New format: use derived episode_ends from EpisodeStore
+            return super().get_sequence(key, start, end)
 
-        parts = [
-            self._decode_frames(key, ep_idx, list(range(lo, hi)))
-            for ep_idx, lo, hi in iter_episode_slices(self._episode_ends, start, end)
-        ]
-        return np.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
 
+# ── Write-once store (new EpisodeStore interface) ─────────────────────────────
 
-# ── Write-once store ──────────────────────────────────────────────────────────
-
-class VideoStoreWriter(WritableTrajectoryStore):
-    """Write-once MP4 video store.
+class VideoStoreWriter(WritableEpisodeStore):
+    """Write-once MP4 video store with episode-indexed layout.
 
     Video keys are encoded as one MP4 per episode using PyAV.
-    Non-video keys are written as zarr lz4 arrays.
+    Non-video keys are written as per-episode zarr lz4 arrays under
+    data/<ep_idx:06d>/<key>/.
+
+    put_episode(ep_idx, data) is thread-safe for distinct ep_idx values.
 
     Parameters
     ----------
     path : str
         Output directory.
+    n_episodes : int
+        Total number of episodes (required for episode-indexed layout).
     video_keys : list of str
         Keys whose data will be encoded as video.
     vcodec : str
@@ -344,6 +446,7 @@ class VideoStoreWriter(WritableTrajectoryStore):
     def __init__(
         self,
         path: str,
+        n_episodes: int,
         video_keys: List[str] = (),
         vcodec: str = _DEFAULT_VCODEC,
         crf: int = _DEFAULT_CRF,
@@ -352,6 +455,7 @@ class VideoStoreWriter(WritableTrajectoryStore):
         schemas=None,
     ):
         self.path = path
+        self._n_episodes = n_episodes
         self._video_keys_set = set(video_keys)
         self._video_keys_ordered = list(video_keys)
         self._schemas = dict(schemas or {})
@@ -364,13 +468,15 @@ class VideoStoreWriter(WritableTrajectoryStore):
         for vk in video_keys:
             os.makedirs(os.path.join(path, "videos", vk), exist_ok=True)
 
-        self._episode_ends_list: List[int] = []
-        self._zarr_arrays: Dict[str, object] = {}
         self._all_keys: List[str] = []
         self._shapes: Dict[str, tuple] = {}
         self._dtypes: Dict[str, str] = {}
-        self._frame_count = 0
         self._finalized = False
+        self._next_ep_idx: int = 0  # for legacy sequential put_episode(data)
+
+        # Thread safety: _validate_episode mutates _contract_keys on first call
+        import threading
+        self._contract_lock = threading.Lock()
         self._init_contract()
 
     @classmethod
@@ -379,6 +485,8 @@ class VideoStoreWriter(WritableTrajectoryStore):
         path: str,
         key_shapes: Dict[str, tuple],
         key_dtypes: Dict[str, np.dtype],
+        n_episodes: int = 0,
+        keys: Optional[List[str]] = None,
         image_keys: List[str] = (),
         video_keys: List[str] = (),
         vcodec: str = _DEFAULT_VCODEC,
@@ -396,31 +504,53 @@ class VideoStoreWriter(WritableTrajectoryStore):
                 "pass only one (they are synonyms for this backend)."
             )
         vk = list(video_keys) if video_keys else list(image_keys)
-        writer = cls(path=path, video_keys=vk, vcodec=vcodec, crf=crf, kfi=kfi, fps=fps,
-                     schemas=schemas)
+        writer = cls(
+            path=path, n_episodes=n_episodes, video_keys=vk,
+            vcodec=vcodec, crf=crf, kfi=kfi, fps=fps, schemas=schemas,
+        )
         writer._init_contract(key_shapes, key_dtypes)
+        # Record keys/shapes/dtypes from declared contract
+        resolved_keys = list(keys) if keys is not None else list(key_shapes.keys())
+        writer._all_keys = resolved_keys
+        writer._shapes = {k: tuple(v) for k, v in key_shapes.items()}
+        writer._dtypes = {k: str(np.dtype(v)) for k, v in key_dtypes.items()}
         return writer
 
     @classmethod
     def open_readonly(cls, path: str) -> VideoStore:
         return VideoStore(path)
 
-    def _get_or_create_zarr_array(self, key: str, frame: np.ndarray):
-        if key in self._zarr_arrays:
-            return self._zarr_arrays[key]
-        import numcodecs
-        # Use large chunks for non-video (action/lowdim) data to avoid per-frame
-        # file overhead that zarr directory format suffers from with chunks=(1,...).
-        arr = _open_zarr_array(
-            os.path.join(self.path, "data", key),
-            mode="w",
-            shape=(0,) + frame.shape,
-            chunks=(_NON_VIDEO_CHUNK_FRAMES,) + frame.shape,
-            dtype=frame.dtype,
-            compressor=numcodecs.Blosc(cname="lz4", clevel=1),
-        )
-        self._zarr_arrays[key] = arr
-        return arr
+    # ── EpisodeStore read primitives (available immediately from contract) ─────
+
+    @property
+    def n_episodes(self) -> int:
+        return self._n_episodes
+
+    @property
+    def keys(self) -> List[str]:
+        return self._all_keys
+
+    def frame_shape(self, key: str) -> tuple:
+        return self._shapes[key]
+
+    def frame_dtype(self, key: str) -> np.dtype:
+        return np.dtype(self._dtypes[key])
+
+    def episode_length(self, ep_idx: int) -> int:
+        # Only available after put_episode for that ep_idx; not meaningful pre-write
+        raise NotImplementedError("episode_length not available on writer before finalize")
+
+    def get_frames(self, ep_idx: int, key: str, start: int, end: int) -> np.ndarray:
+        raise NotImplementedError("get_frames not available on writer before finalize")
+
+    def _update_schema_from_data(self, data: Dict[str, np.ndarray]) -> None:
+        """Lock in keys/shapes/dtypes from first episode's data (no-op if already set)."""
+        if not self._all_keys:
+            self._all_keys = list(data.keys())
+            self._shapes = {k: tuple(arr.shape[1:]) for k, arr in data.items()}
+            self._dtypes = {k: str(arr.dtype) for k, arr in data.items()}
+
+    # ── Video encoding ────────────────────────────────────────────────────────
 
     def _encode_episode_video(self, key: str, ep_idx: int, frames: np.ndarray) -> None:
         import av as av_mod
@@ -442,50 +572,86 @@ class VideoStoreWriter(WritableTrajectoryStore):
             c.mux(p)
         c.close()
 
-    def put_episode(self, data: Dict[str, np.ndarray]) -> None:
+    # ── Write interface ────────────────────────────────────────────────────────
+
+    def put_episode(self, ep_idx_or_data, data: Optional[Dict[str, np.ndarray]] = None) -> None:
+        """Write episode.
+
+        Two calling conventions are accepted:
+          put_episode(ep_idx, data)   — new episode-indexed interface
+          put_episode(data)           — legacy sequential interface (ep_idx auto-assigned)
+        """
         assert not self._finalized, "Cannot write after finalize()"
-        ep_idx = len(self._episode_ends_list)
-        T = self._validate_episode(data, episode_idx=ep_idx)
-        for key, arr in data.items():
-            if key not in self._all_keys:
-                self._all_keys.append(key)
-                self._shapes[key] = tuple(arr.shape[1:])
-                self._dtypes[key] = str(arr.dtype)
+
+        # Detect calling convention
+        if data is None:
+            # Legacy: put_episode(data) — auto-assign next sequential ep_idx
+            actual_data = ep_idx_or_data
+            with self._contract_lock:
+                ep_idx = self._next_ep_idx
+                self._next_ep_idx += 1
+                T = self._validate_episode(actual_data, episode_idx=ep_idx)
+                self._update_schema_from_data(actual_data)
+        else:
+            ep_idx = ep_idx_or_data
+            actual_data = data
+            with self._contract_lock:
+                T = self._validate_episode(actual_data, episode_idx=ep_idx)
+                self._update_schema_from_data(actual_data)
+
+        # Write video keys
+        for key, arr in actual_data.items():
             if key in self._video_keys_set:
                 self._encode_episode_video(key, ep_idx, arr)
-            else:
-                _zarr_append(self._get_or_create_zarr_array(key, arr[0]), arr)
 
-        self._frame_count += T
-        self._episode_ends_list.append(self._frame_count)
+        # Write non-video keys as per-episode zarr
+        non_video = {k: v for k, v in actual_data.items() if k not in self._video_keys_set}
+        if non_video:
+            import numcodecs
+            ep_dir = os.path.join(self.path, "data", f"{ep_idx:06d}")
+            os.makedirs(ep_dir, exist_ok=True)
+            for key, arr in non_video.items():
+                arr_path = os.path.join(ep_dir, key)
+                frame_shape = tuple(arr.shape[1:])
+                chunk_t = min(T, _NON_VIDEO_CHUNK_FRAMES)
+                chunks = (chunk_t,) + frame_shape
+                zarr_arr = _open_zarr_array(
+                    arr_path,
+                    mode="w",
+                    shape=arr.shape,
+                    chunks=chunks,
+                    dtype=arr.dtype,
+                    compressor=numcodecs.Blosc(cname="lz4", clevel=1),
+                )
+                zarr_arr[:] = arr
 
     def finalize(self) -> None:
+        """Write meta.json.  Call after all put_episode() calls complete."""
         from ..schema import schemas_to_meta, validate_schemas_against_shapes
 
         validate_schemas_against_shapes(self._schemas, self._shapes)
-        n_episodes = len(self._episode_ends_list)
-        for key, arr in self._zarr_arrays.items():
-            assert arr.shape[0] == self._frame_count, (
-                f"Key {key!r}: stored {arr.shape[0]} frames, expected "
-                f"{self._frame_count} — store is inconsistent."
-            )
+
+        # Verify video file counts (skip check if n_episodes was not declared)
         for key in self._all_keys:
             if key not in self._video_keys_set:
                 continue
             vid_dir = os.path.join(self.path, "videos", key)
-            n_files = len([f for f in os.listdir(vid_dir) if f.endswith(".mp4")])
-            assert n_files == n_episodes, (
-                f"Video key {key!r}: {n_files} episode files in {vid_dir!r}, "
-                f"expected {n_episodes} — store is inconsistent."
-            )
-        ep_ends = np.array(self._episode_ends_list, dtype=np.int64)
-        np.save(os.path.join(self.path, "episode_ends.npy"), ep_ends)
+            if os.path.isdir(vid_dir):
+                n_files = len([f for f in os.listdir(vid_dir) if f.endswith(".mp4")])
+                if self._n_episodes > 0:
+                    assert n_files == self._n_episodes, (
+                        f"Video key {key!r}: {n_files} episode files in {vid_dir!r}, "
+                        f"expected {self._n_episodes} — store is inconsistent."
+                    )
+                else:
+                    # n_episodes was not declared; infer from file count
+                    self._n_episodes = n_files
+
         meta = {
             "keys": self._all_keys,
             "shapes": {k: list(v) for k, v in self._shapes.items()},
             "dtypes": self._dtypes,
-            "n_episodes": len(self._episode_ends_list),
-            "n_frames": self._frame_count,
+            "n_episodes": self._n_episodes,
             "video_keys": self._video_keys_ordered,
             "vcodec": self._vcodec,
             "crf": self._crf,
@@ -496,30 +662,3 @@ class VideoStoreWriter(WritableTrajectoryStore):
         with open(os.path.join(self.path, _META_FILE), "w") as f:
             json.dump(meta, f, indent=2)
         self._finalized = True
-        self._episode_ends = ep_ends
-
-    # ── Read interface (available after finalize) ─────────────────────────────
-
-    @property
-    def episode_ends(self) -> np.ndarray:
-        if not self._finalized:
-            return np.array(self._episode_ends_list, dtype=np.int64)
-        return self._episode_ends
-
-    @property
-    def keys(self) -> List[str]:
-        return self._all_keys
-
-    def frame_shape(self, key: str) -> tuple:
-        return self._shapes[key]
-
-    def frame_dtype(self, key: str) -> np.dtype:
-        return np.dtype(self._dtypes[key])
-
-    def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
-        if key not in self._video_keys_set:
-            return self._zarr_arrays[key][start:end]
-        assert self._finalized, "Cannot read video keys before finalize()"
-        if not hasattr(self, "_video_reader") or self._video_reader is None:
-            self._video_reader = VideoStore(self.path)
-        return self._video_reader.get_sequence(key, start, end)

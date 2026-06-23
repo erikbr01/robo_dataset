@@ -1,6 +1,6 @@
 """Shared-memory RAM store.
 
-Loads an entire TrajectoryStore into ``torch.Tensor``s backed by POSIX shared
+Loads an entire EpisodeStore into ``torch.Tensor``s backed by POSIX shared
 memory (``tensor.share_memory_()``).  After the initial load all DataLoader
 workers access the data zero-copy without any disk I/O, zarr decompression, or
 file-system calls — they simply read from the same physical memory pages.
@@ -36,10 +36,10 @@ except ImportError:
 
 import torch
 
-from .base import TrajectoryStore
+from .base import EpisodeStore
 
 
-class ShmStore(TrajectoryStore):
+class ShmStore(EpisodeStore):
     """Read-only in-RAM store backed by torch shared memory.
 
     Workers forked by ``torch.utils.data.DataLoader`` access the tensors
@@ -51,30 +51,29 @@ class ShmStore(TrajectoryStore):
 
     def __init__(
         self,
-        data: Dict[str, torch.Tensor],
-        episode_ends: np.ndarray,
+        data: List[Dict[str, torch.Tensor]],
         dtypes: Dict[str, np.dtype],
         shapes: Dict[str, tuple],
+        keys: List[str],
     ):
-        self._data = data
-        self._episode_ends = episode_ends
+        self._data = data  # List[Dict[str, Tensor]], one per episode
         self._dtypes = dtypes
         self._shapes = shapes
-        self._keys: List[str] = list(data.keys())
+        self._keys: List[str] = keys
 
     @classmethod
     def from_store(
         cls,
-        source: TrajectoryStore,
+        source: EpisodeStore,
         keys: Optional[List[str]] = None,
         verbose: bool = True,
     ) -> "ShmStore":
-        """Load all frames from *source* into shared memory.
+        """Load all episodes from *source* into shared memory.
 
         Args:
-            source:  Any :class:`~robo_dataset.backends.base.TrajectoryStore`.
-                     ``get_sequence`` is called once per key to load the full
-                     dataset; this is the one-time startup cost.
+            source:  Any :class:`~robo_dataset.backends.base.EpisodeStore`.
+                     ``get_episode`` is called once per episode; this is the
+                     one-time startup cost.
             keys:    Subset of keys to load.  Defaults to all keys.
             verbose: Show a tqdm progress bar while loading.
 
@@ -82,33 +81,36 @@ class ShmStore(TrajectoryStore):
             An :class:`ShmStore` ready for use as a DataLoader dataset backend.
         """
         keys = keys or list(source.keys)
-        ep_ends = source.episode_ends
-        n_frames = int(ep_ends[-1]) if len(ep_ends) > 0 else 0
 
-        dtypes: Dict[str, np.dtype] = {}
-        shapes: Dict[str, tuple] = {}
-        data: Dict[str, torch.Tensor] = {}
+        dtypes: Dict[str, np.dtype] = {k: source.frame_dtype(k) for k in keys}
+        shapes: Dict[str, tuple] = {k: source.frame_shape(k) for k in keys}
 
-        it = _tqdm(keys, desc="ShmStore: loading to shared memory") if verbose else keys
+        episodes_range = range(source.n_episodes)
+        it = _tqdm(episodes_range, desc="ShmStore: loading to shared memory") if verbose else episodes_range
 
-        for key in it:
-            arr = source.get_sequence(key, 0, n_frames)
-            arr = np.ascontiguousarray(arr)  # some backends return non-contiguous views
-            dtypes[key] = arr.dtype
-            shapes[key] = source.frame_shape(key)
-            data[key] = torch.from_numpy(arr).share_memory_()
+        data: List[Dict[str, torch.Tensor]] = []
+        for ep_idx in it:
+            ep = source.get_episode(ep_idx)
+            ep_tensors: Dict[str, torch.Tensor] = {}
+            for k in keys:
+                arr = np.ascontiguousarray(ep[k])
+                ep_tensors[k] = torch.from_numpy(arr).share_memory_()
+            data.append(ep_tensors)
 
-        return cls(data, ep_ends.copy(), dtypes, shapes)
+        return cls(data, dtypes, shapes, keys)
 
-    # ── TrajectoryStore interface ─────────────────────────────────────────────
+    # ── EpisodeStore interface ─────────────────────────────────────────────────
 
     @property
-    def episode_ends(self) -> np.ndarray:
-        return self._episode_ends
+    def n_episodes(self) -> int:
+        return len(self._data)
 
     @property
     def keys(self) -> List[str]:
         return self._keys
+
+    def episode_length(self, ep_idx: int) -> int:
+        return int(self._data[ep_idx][self._keys[0]].shape[0])
 
     def frame_shape(self, key: str) -> tuple:
         return self._shapes[key]
@@ -116,8 +118,8 @@ class ShmStore(TrajectoryStore):
     def frame_dtype(self, key: str) -> np.dtype:
         return self._dtypes[key]
 
-    def get_sequence(self, key: str, start: int, end: int) -> np.ndarray:
-        return self._data[key][start:end].numpy()
+    def get_frames(self, ep_idx: int, key: str, start: int, end: int) -> np.ndarray:
+        return self._data[ep_idx][key][start:end].numpy()
 
     def on_worker_init(self, worker_id: int) -> None:
         pass  # shared memory survives fork — nothing to reopen

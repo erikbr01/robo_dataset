@@ -600,3 +600,143 @@ class TestVideoStoreEquivalence:
         batch = next(iter(loader))
         assert batch[OBS_KEYS[0]].shape == (4, 4, H, W, C)
         assert batch["action"].shape == (4, 4, ACTION_DIM)
+
+
+# ── HDF5 EpisodeStore native get_frames ──────────────────────────────────────
+
+class TestHDF5EpisodeStore:
+    """RobomimicHDF5Store now inherits EpisodeStore — test native get_frames/get_episode."""
+
+    def test_is_episode_store(self, synthetic_hdf5):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.base import EpisodeStore
+        store = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        assert isinstance(store, EpisodeStore)
+
+    def test_get_frames_action(self, synthetic_hdf5):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        store = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        frames = store.get_frames(0, "action", 0, EP_LENGTHS[0])
+        assert frames.shape == (EP_LENGTHS[0], ACTION_DIM)
+
+    def test_get_frames_partial(self, synthetic_hdf5):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        store = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        frames = store.get_frames(1, "action", 2, 5)
+        assert frames.shape == (3, ACTION_DIM)
+
+    def test_get_episode_matches_get_frames(self, synthetic_hdf5):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        store = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        ep = store.get_episode(2)
+        for k in store.keys:
+            direct = store.get_frames(2, k, 0, EP_LENGTHS[2])
+            np.testing.assert_array_equal(ep[k], direct)
+
+    def test_episode_ends_derived(self, synthetic_hdf5):
+        """episode_ends is derived from episode_length(), not stored on disk."""
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        store = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        expected = np.cumsum(EP_LENGTHS).astype(np.int64)
+        np.testing.assert_array_equal(store.episode_ends, expected)
+
+    def test_get_sequence_via_derived(self, synthetic_hdf5):
+        """get_sequence() works through the derived EpisodeStore implementation."""
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        store = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+        # Cross-episode: last 3 of ep0 + first 3 of ep1
+        start = EP_LENGTHS[0] - 3
+        end = EP_LENGTHS[0] + 3
+        seq = store.get_sequence("action", start, end)
+        assert seq.shape == (6, ACTION_DIM)
+        # Must match get_frames for each episode separately
+        tail = store.get_frames(0, "action", EP_LENGTHS[0] - 3, EP_LENGTHS[0])
+        head = store.get_frames(1, "action", 0, 3)
+        np.testing.assert_array_equal(seq, np.concatenate([tail, head], axis=0))
+
+
+# ── ShmStore EpisodeStore interface ──────────────────────────────────────────
+
+class TestShmEpisodeStore:
+    """ShmStore now inherits EpisodeStore — test episode-indexed interface."""
+
+    def test_is_episode_store(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        from robo_dataset.backends.base import EpisodeStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        assert isinstance(shm, EpisodeStore)
+
+    def test_episode_lengths(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        for i, expected_T in enumerate(EP_LENGTHS):
+            assert shm.episode_length(i) == expected_T
+
+    def test_get_frames_matches_get_sequence(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        for ep_idx, T in enumerate(EP_LENGTHS):
+            frames = shm.get_frames(ep_idx, "action", 0, T)
+            start = shm.episode_start(ep_idx)
+            seq = shm.get_sequence("action", start, start + T)
+            np.testing.assert_array_equal(frames, seq)
+
+    def test_episode_ends_derived(self, zarr_store_path):
+        from robo_dataset.backends.zarr_backend import ZarrStore
+        from robo_dataset.backends.shm import ShmStore
+        src = ZarrStore(zarr_store_path)
+        shm = ShmStore.from_store(src, verbose=False)
+        expected = np.cumsum(EP_LENGTHS).astype(np.int64)
+        np.testing.assert_array_equal(shm.episode_ends, expected)
+
+
+# ── Parallel convert() ────────────────────────────────────────────────────────
+
+class TestParallelConvert:
+    """convert() with workers > 1 produces same result as workers=1."""
+
+    def test_parallel_zarr_episode(self, synthetic_hdf5, tmp_path):
+        from robo_dataset.backends.hdf5 import RobomimicHDF5Store
+        from robo_dataset.backends.zarr_episode import ZarrEpisodeStore, ZarrEpisodeStoreWriter
+        from robo_dataset.convert import convert
+
+        src = RobomimicHDF5Store(synthetic_hdf5, obs_keys=OBS_KEYS + [LOWDIM_KEY])
+
+        # Serial convert
+        serial_path = str(tmp_path / "serial")
+        w1 = ZarrEpisodeStoreWriter.create(
+            path=serial_path,
+            n_episodes=src.n_episodes,
+            keys=src.keys,
+            key_shapes={k: src.frame_shape(k) for k in src.keys},
+            key_dtypes={k: src.frame_dtype(k) for k in src.keys},
+        )
+        convert(src, w1, workers=1, verbose=False)
+
+        # Parallel convert
+        parallel_path = str(tmp_path / "parallel")
+        w2 = ZarrEpisodeStoreWriter.create(
+            path=parallel_path,
+            n_episodes=src.n_episodes,
+            keys=src.keys,
+            key_shapes={k: src.frame_shape(k) for k in src.keys},
+            key_dtypes={k: src.frame_dtype(k) for k in src.keys},
+        )
+        convert(src, w2, workers=3, verbose=False)
+
+        s1 = ZarrEpisodeStore(serial_path)
+        s2 = ZarrEpisodeStore(parallel_path)
+
+        assert s1.n_episodes == s2.n_episodes
+        for ep_idx in range(s1.n_episodes):
+            for key in ["action"]:
+                np.testing.assert_array_equal(
+                    s1.get_frames(ep_idx, key, 0, s1.episode_length(ep_idx)),
+                    s2.get_frames(ep_idx, key, 0, s2.episode_length(ep_idx)),
+                )

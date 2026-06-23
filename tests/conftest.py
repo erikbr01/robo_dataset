@@ -96,6 +96,8 @@ def video_store_path(synthetic_hdf5, tmp_path_factory):
     out_path = str(tmp_path_factory.mktemp("video") / "test.video")
     writer = VideoStoreWriter.create(
         path=out_path,
+        n_episodes=hdf5.n_episodes,
+        keys=hdf5.keys,
         key_shapes={k: hdf5.frame_shape(k) for k in hdf5.keys},
         key_dtypes={k: hdf5.frame_dtype(k) for k in hdf5.keys},
         image_keys=OBS_KEYS,

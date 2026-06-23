@@ -6,11 +6,15 @@ here to avoid crashes in environments where torch is unavailable or broken.
 """
 
 from .backends import (
+    EpisodeStore,
+    WritableEpisodeStore,
     TrajectoryStore,
     WritableTrajectoryStore,
     RobomimicHDF5Store,
     ZarrStore,
     ZarrStoreWriter,
+    ZarrEpisodeStore,
+    ZarrEpisodeStoreWriter,
     ShmStore,
     VideoStore,
     VideoStoreWriter,
@@ -21,11 +25,15 @@ from .schema import Field, VectorSchema
 from .normalization import KeyNormalizer, compute_stats, fit_key, fit_store_normalizers
 
 __all__ = [
+    "EpisodeStore",
+    "WritableEpisodeStore",
     "TrajectoryStore",
     "WritableTrajectoryStore",
     "RobomimicHDF5Store",
     "ZarrStore",
     "ZarrStoreWriter",
+    "ZarrEpisodeStore",
+    "ZarrEpisodeStoreWriter",
     "ZarrShardedStore",
     "ZarrShardedStoreWriter",
     "RLDSFrameStore",
@@ -55,7 +63,8 @@ def __getattr__(name):
         from .prefetch import DataPrefetcher
         return DataPrefetcher
     if name in ("ZarrShardedStore", "ZarrShardedStoreWriter",
-                "RLDSFrameStore", "RLDSFrameStoreWriter"):
+                "RLDSFrameStore", "RLDSFrameStoreWriter",
+                "LeRobotStore", "DroidStore"):
         from . import backends
         return getattr(backends, name)
     raise AttributeError(f"module 'robo_dataset' has no attribute {name!r}")

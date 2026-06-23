@@ -70,6 +70,7 @@ class DroidStore(TrajectoryStore):
         image_size: tuple = (180, 320),
         action_space: str = "joint_velocity",
         max_episodes: Optional[int] = None,
+        session_offset: int = 0,
         droid_package_path: str = "~/src_droid",
         zed_settings_path: Optional[str] = None,
         skip_empty: bool = False,

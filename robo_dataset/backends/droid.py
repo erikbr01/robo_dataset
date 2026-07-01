@@ -42,7 +42,7 @@ import logging
 import os
 import sys
 from collections import OrderedDict
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional
 
 import numpy as np
 
@@ -75,7 +75,7 @@ class DroidStore(TrajectoryStore):
         zed_settings_path: Optional[str] = None,
         skip_empty: bool = False,
         skip_corrupt: bool = False,
-        session_offset: int = 0,
+        dates: Optional[Iterable[str]] = None,
     ):
         if camera_source not in ("none", "svo", "mp4"):
             raise ValueError(f"camera_source must be none|svo|mp4, got {camera_source!r}")
@@ -101,23 +101,44 @@ class DroidStore(TrajectoryStore):
             if "trajectory.h5" in files:
                 sessions.append(root)
         sessions.sort()
+        # Restrict to sessions whose date dir (.../<split>/<date>/<timestamp>/)
+        # is in `dates`. Applied before session_offset/max_episodes so worker
+        # shards tile the same filtered, ordered list.
+        if dates:
+            _dates = set(dates)
+            sessions = [
+                s for s in sessions
+                if os.path.basename(os.path.dirname(s)) in _dates
+            ]
         if session_offset:
             sessions = sessions[session_offset:]
         if max_episodes is not None:
             sessions = sessions[:max_episodes]
         if not sessions:
-            raise ValueError(f"No trajectory.h5 sessions found under {path!r}")
+            raise ValueError(
+                f"No trajectory.h5 sessions found under {path!r}"
+                + (f" for dates {sorted(set(dates))}" if dates else "")
+            )
 
         # Episode lengths from the movement mask — no camera decode needed.
         import h5py
         lengths = []
         kept_sessions = []
         for s in sessions:
-            with h5py.File(os.path.join(s, "trajectory.h5"), "r") as f:
-                if _MOVEMENT_KEY in f:
-                    T = int(f[_MOVEMENT_KEY][:].astype(bool).sum())
-                else:
-                    T = int(f[f"action/{self.action_space}"].shape[0])
+            try:
+                with h5py.File(os.path.join(s, "trajectory.h5"), "r") as f:
+                    if _MOVEMENT_KEY in f:
+                        T = int(f[_MOVEMENT_KEY][:].astype(bool).sum())
+                    else:
+                        T = int(f[f"action/{self.action_space}"].shape[0])
+            except (OSError, KeyError) as exc:
+                # Truncated/corrupt or schema-incomplete trajectory.h5 (e.g.
+                # "file signature not found"). Skip like any other corrupt
+                # session rather than aborting construction of the whole store.
+                if self._skip_corrupt:
+                    _log.warning("skipping session with unreadable trajectory.h5 (%s): %s", s, exc)
+                    continue
+                raise
             if T == 0:
                 if self._skip_empty:
                     _log.warning("skipping zero-step session: %s", s)
@@ -237,8 +258,16 @@ class DroidStore(TrajectoryStore):
         init = sl.InitParameters()
         init.set_from_svo_file(svo_path)
         init.svo_real_time_mode = False
+        # We only retrieve the rectified LEFT image; depth is never used.
+        # SDK 5.x defaults DEPTH_MODE to NEURAL, whose init pulls in TensorRT
+        # and a neural engine — absent in a lib-only (non-system) SDK deploy,
+        # it fails open() with "CORRUPTED SDK INSTALLATION". NONE skips all AI.
+        init.depth_mode = sl.DEPTH_MODE.NONE
         if self.zed_settings_path:
-            init.optional_settings_path = self.zed_settings_path
+            # The SDK looks up "<optional_settings_path>SN<serial>.conf" without
+            # inserting a separator, so a dir without a trailing slash misses the
+            # calibration file. Normalize to guarantee the trailing separator.
+            init.optional_settings_path = os.path.join(self.zed_settings_path, "")
         cam = sl.Camera()
         status = cam.open(init)
         if status != sl.ERROR_CODE.SUCCESS:

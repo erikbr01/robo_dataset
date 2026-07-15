@@ -22,6 +22,10 @@ Exposed keys:
 
 Cameras:
   cameras={"hand_camera_image": "14313307"} maps obs keys to ZED serials.
+  For "svo", a serial may carry an optional ``:right`` suffix (e.g.
+  "14313307:right") to decode the camera's right stereo view instead of the
+  default rectified left view — the same physical camera can be mapped to
+  two obs keys this way to expose both eyes.
   camera_source picks the decode path:
     "svo"   decode recordings/SVO/<serial>.svo* via pyzed (needs the ZED SDK
             shared libs on LD_LIBRARY_PATH)
@@ -57,6 +61,12 @@ _LOWDIM_KEYS = {
     "gripper_position": (1,),
 }
 _MOVEMENT_KEY = "observation/controller_info/movement_enabled"
+
+
+def _parse_camera_spec(spec: str) -> tuple:
+    """Split an SVO camera spec "SERIAL" or "SERIAL:right" into (serial, view)."""
+    serial, _, view = spec.partition(":")
+    return serial, (view or "left")
 
 
 class DroidStore(TrajectoryStore):
@@ -231,9 +241,12 @@ class DroidStore(TrajectoryStore):
 
     # ── camera decode ─────────────────────────────────────────────────────────
 
-    def _read_svo_frames(self, session: str, serial: str, valid_mask: np.ndarray) -> np.ndarray:
-        """Decode left-view frames from recordings/SVO/<serial>.svo*, keeping
-        frames where valid_mask is True (frame i ↔ raw step i)."""
+    def _read_svo_frames(
+        self, session: str, serial: str, valid_mask: np.ndarray, view: str = "left"
+    ) -> np.ndarray:
+        """Decode `view`-eye ("left" or "right") frames from
+        recordings/SVO/<serial>.svo*, keeping frames where valid_mask is True
+        (frame i ↔ raw step i)."""
         try:
             import pyzed.sl as sl
         except ImportError as e:
@@ -255,13 +268,15 @@ class DroidStore(TrajectoryStore):
                 f"No SVO recording for serial {serial!r} under {svo_dir!r}"
             )
 
+        sl_view = sl.VIEW.RIGHT if view == "right" else sl.VIEW.LEFT
+
         init = sl.InitParameters()
         init.set_from_svo_file(svo_path)
         init.svo_real_time_mode = False
-        # We only retrieve the rectified LEFT image; depth is never used.
-        # SDK 5.x defaults DEPTH_MODE to NEURAL, whose init pulls in TensorRT
-        # and a neural engine — absent in a lib-only (non-system) SDK deploy,
-        # it fails open() with "CORRUPTED SDK INSTALLATION". NONE skips all AI.
+        # Depth is never used regardless of which eye is retrieved. SDK 5.x
+        # defaults DEPTH_MODE to NEURAL, whose init pulls in TensorRT and a
+        # neural engine — absent in a lib-only (non-system) SDK deploy, it
+        # fails open() with "CORRUPTED SDK INSTALLATION". NONE skips all AI.
         init.depth_mode = sl.DEPTH_MODE.NONE
         if self.zed_settings_path:
             # The SDK looks up "<optional_settings_path>SN<serial>.conf" without
@@ -289,7 +304,7 @@ class DroidStore(TrajectoryStore):
                 cam.close()
                 raise RuntimeError(f"SVO grab failed ({status}) at frame {frame_idx}: {svo_path}")
             if frame_idx < len(valid_mask) and valid_mask[frame_idx]:
-                cam.retrieve_image(mat, sl.VIEW.LEFT)
+                cam.retrieve_image(mat, sl_view)
                 img = cv2.cvtColor(mat.get_data(), cv2.COLOR_BGRA2RGB)
                 if img.shape[:2] != (self.image_h, self.image_w):
                     img = cv2.resize(img, (self.image_w, self.image_h),
@@ -372,8 +387,9 @@ class DroidStore(TrajectoryStore):
         T = data["action"].shape[0]
 
         if self.camera_source == "svo":
-            for obs_key, serial in self.cameras.items():
-                data[obs_key] = self._read_svo_frames(session, serial, mask)
+            for obs_key, spec in self.cameras.items():
+                serial, view = _parse_camera_spec(spec)
+                data[obs_key] = self._read_svo_frames(session, serial, mask, view=view)
         elif self.camera_source == "mp4":
             data.update(self._read_mp4_frames(session, T))
 

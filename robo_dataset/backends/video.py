@@ -11,7 +11,11 @@ backward compatibility.  New stores written by VideoStoreWriter use the new layo
 Read path uses torchcodec VideoDecoder with seek_mode='approximate'.
 Decoders are cached per (key, episode_idx) per worker with an LRU cap
 to bound peak memory.  Call on_worker_init() in DataLoader workers to
-clear stale post-fork state.
+clear stale post-fork state.  The decoder cache is also safe to share
+across threads within one process (e.g. a ThreadPoolExecutor loading
+many episodes concurrently) — cache bookkeeping is lock-protected,
+though decoding itself is not synchronized (each decoder instance is
+only ever touched by whichever thread's get()/put() sequence owns it).
 
 Write path uses PyAV (libx264 by default) for video keys and zarr lz4
 for non-video keys.
@@ -21,6 +25,7 @@ import fractions
 import json
 import logging
 import os
+import threading
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
@@ -199,26 +204,36 @@ _DECODER_CLS = {"modern": _ModernDecoder, "legacy": _LegacyDecoder, "pyav": _PyA
 
 
 class _LRUDecoderCache:
+    """Thread-safe (a single lock around each op — cheap, since the guarded
+    work is OrderedDict bookkeeping, not decoding). Needed because VideoStore
+    is used concurrently from multiple threads (e.g. shm-loading with
+    ThreadPoolExecutor), where plain-dict check-then-act races could raise
+    (move_to_end on a key another thread just evicted) or double-evict."""
+
     def __init__(self, maxsize: int = _DEFAULT_MAX_DECODERS):
         self._cache: OrderedDict = OrderedDict()
         self._maxsize = maxsize
+        self._lock = threading.Lock()
 
     def get(self, key):
-        if key not in self._cache:
-            return None
-        self._cache.move_to_end(key)
-        return self._cache[key]
+        with self._lock:
+            if key not in self._cache:
+                return None
+            self._cache.move_to_end(key)
+            return self._cache[key]
 
     def put(self, key, decoder) -> None:
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        else:
-            if len(self._cache) >= self._maxsize:
-                self._cache.popitem(last=False)
-            self._cache[key] = decoder
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            else:
+                if len(self._cache) >= self._maxsize:
+                    self._cache.popitem(last=False)
+                self._cache[key] = decoder
 
     def clear(self) -> None:
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
 
 # ── Read-only store ───────────────────────────────────────────────────────────

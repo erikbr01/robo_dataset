@@ -259,6 +259,35 @@ class TestConvert:
         copy = dst.get_sequence("action", 0, dst.n_frames)
         np.testing.assert_array_equal(orig, copy)
 
+    def test_convert_episode_indices_selects_and_reindexes_subset(self, zarr_store_path, tmp_path):
+        """convert() episode_indices= keeps only the given source episodes,
+        in the given order, renumbered contiguously from 0 in the target --
+        not just filtered, but reindexed (order and selection both matter)."""
+        from robo_dataset.backends.zarr_backend import ZarrStore, ZarrStoreWriter
+        from robo_dataset.convert import convert
+
+        src = ZarrStore(zarr_store_path)
+        assert src.n_episodes == N_EPISODES == 5
+        episode_indices = [3, 0, 4]  # subset, deliberately out of order
+
+        out_path = str(tmp_path / "zarr_subset_reindexed")
+        writer = ZarrStoreWriter.create(
+            path=out_path,
+            key_shapes={k: src.frame_shape(k) for k in src.keys},
+            key_dtypes={k: src.frame_dtype(k) for k in src.keys},
+            image_keys=OBS_KEYS,
+        )
+        convert(src, writer, episode_indices=episode_indices, verbose=False)
+
+        dst = ZarrStore(out_path)
+        assert dst.n_episodes == len(episode_indices)
+        for dst_idx, src_idx in enumerate(episode_indices):
+            src_len = src.episode_length(src_idx)
+            assert dst.episode_length(dst_idx) == src_len
+            orig = src.get_frames(src_idx, "action", 0, src_len)
+            copy = dst.get_frames(dst_idx, "action", 0, src_len)
+            np.testing.assert_array_equal(orig, copy)
+
     @requires_rlds
     def test_convert_rlds_from_zarr(self, zarr_store_path, tmp_path):
         """convert_rlds() works with a zarr source (non-HDF5 input path)."""

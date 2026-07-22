@@ -140,6 +140,44 @@ class CenterCrop(GPUBatchTransform):
         return out
 
 
+class Resize(GPUBatchTransform):
+    """Deterministic resize for image keys to a fixed (h, w) via area-weighted
+    averaging. No-op when already at target size.
+
+    ``F.interpolate(mode="area")`` is the same algorithm as
+    ``cv2.resize(..., interpolation=cv2.INTER_AREA)`` (exact for integer
+    downscale factors, the common case here): both average input pixels
+    falling in each output cell. Use this when a source key's images arrive
+    at a resolution that doesn't match what a store/model downstream
+    expects -- e.g. adapting a live camera's native resolution to a
+    checkpoint's trained shape at inference time.
+
+    Args:
+        image_keys: Keys to resize.
+        size:       Output spatial size (H, W).
+    """
+
+    def __init__(self, image_keys: List[str], size: Tuple[int, int]):
+        self.image_keys = set(image_keys)
+        self.size = size
+
+    @torch.no_grad()
+    def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out = dict(batch)
+        oh, ow = self.size
+        for key in self.image_keys:
+            if key not in batch:
+                continue
+            x = batch[key]  # (B, T, C, H, W)
+            H, W = x.shape[-2:]
+            if (H, W) == (oh, ow):
+                continue
+            B, T, C = x.shape[:3]
+            flat = F.interpolate(x.reshape(B * T, C, H, W), size=(oh, ow), mode="area")
+            out[key] = flat.reshape(B, T, C, oh, ow)
+        return out
+
+
 class ColorJitter(GPUBatchTransform):
     """
     Random brightness/contrast/saturation jitter for image keys.

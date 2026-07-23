@@ -19,11 +19,16 @@ Usage:
     convert(src, dst, verbose=True)
 """
 
-from typing import Callable, Dict, List, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import numpy as np
 
 from .backends.base import EpisodeStore, WritableEpisodeStore, WritableTrajectoryStore
+
+if TYPE_CHECKING:
+    from .backends.rlds import RLDSFrameStore
 
 
 def convert(

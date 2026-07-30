@@ -31,6 +31,11 @@ Cameras:
             shared libs on LD_LIBRARY_PATH)
     "mp4"   decode recordings/MP4 via the official ``droid`` package loader
             (lazy import; pass droid_package_path if not installed)
+    "episode_mp4"  decode flat per-episode ``<session>/<obs_key>.mp4`` files
+            (the droid_collect_rollouts.py layout: one RGB video per camera
+            next to trajectory.h5, frame i ↔ raw step i). ``cameras`` maps
+            obs keys to file stems and defaults to the stems found in the
+            first session.
     "none"  lowdim only (default)
 
 Camera decode failures and frame-count mismatches raise — a session with
@@ -87,9 +92,11 @@ class DroidStore(TrajectoryStore):
         skip_corrupt: bool = False,
         dates: Optional[Iterable[str]] = None,
     ):
-        if camera_source not in ("none", "svo", "mp4"):
-            raise ValueError(f"camera_source must be none|svo|mp4, got {camera_source!r}")
-        if camera_source != "none" and not cameras:
+        if camera_source not in ("none", "svo", "mp4", "episode_mp4"):
+            raise ValueError(
+                f"camera_source must be none|svo|mp4|episode_mp4, got {camera_source!r}"
+            )
+        if camera_source not in ("none", "episode_mp4") and not cameras:
             raise ValueError("cameras={obs_key: zed_serial} required with camera_source")
 
         self.path = path
@@ -160,6 +167,21 @@ class DroidStore(TrajectoryStore):
             kept_sessions.append(s)
         self.sessions = kept_sessions
         self._episode_ends = np.cumsum(lengths).astype(np.int64)
+
+        # Flat per-episode videos: default the camera map to the file stems
+        # present in the first session (identity obs_key -> stem mapping).
+        if camera_source == "episode_mp4" and not self.cameras:
+            stems = sorted(
+                os.path.splitext(f)[0]
+                for f in os.listdir(self.sessions[0])
+                if f.endswith(".mp4")
+            )
+            if not stems:
+                raise ValueError(
+                    f"camera_source='episode_mp4' but no *.mp4 next to "
+                    f"trajectory.h5 in {self.sessions[0]!r}"
+                )
+            self.cameras = {stem: stem for stem in stems}
 
         self._shapes: Dict[str, tuple] = dict(_LOWDIM_KEYS)
         self._shapes["action"] = (8,)
@@ -373,6 +395,35 @@ class DroidStore(TrajectoryStore):
             out[obs_key] = np.stack(frames).astype(np.uint8)
         return out
 
+    def _read_episode_mp4_frames(
+        self, session: str, stem: str, valid_mask: np.ndarray
+    ) -> np.ndarray:
+        """Decode ``<session>/<stem>.mp4``, keeping frames where valid_mask is
+        True (frame i ↔ raw step i). Frames were written post BGR→RGB
+        conversion (droid_collect_rollouts.py), so no channel swap here."""
+        import av
+        import cv2
+
+        path = os.path.join(session, f"{stem}.mp4")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"No per-episode video {path!r}")
+        frames = []
+        frame_idx = 0
+        with av.open(path) as container:
+            for frame in container.decode(video=0):
+                if frame_idx < len(valid_mask) and valid_mask[frame_idx]:
+                    img = frame.to_ndarray(format="rgb24")
+                    if img.shape[:2] != (self.image_h, self.image_w):
+                        img = cv2.resize(img, (self.image_w, self.image_h),
+                                         interpolation=cv2.INTER_AREA)
+                    frames.append(img)
+                frame_idx += 1
+        if frame_idx != len(valid_mask):
+            raise ValueError(
+                f"{path}: {frame_idx} frames != {len(valid_mask)} raw steps"
+            )
+        return np.stack(frames).astype(np.uint8)
+
     # ── episode assembly ──────────────────────────────────────────────────────
 
     def _load_episode(self, ep_idx: int) -> Dict[str, np.ndarray]:
@@ -392,6 +443,9 @@ class DroidStore(TrajectoryStore):
                 data[obs_key] = self._read_svo_frames(session, serial, mask, view=view)
         elif self.camera_source == "mp4":
             data.update(self._read_mp4_frames(session, T))
+        elif self.camera_source == "episode_mp4":
+            for obs_key, stem in self.cameras.items():
+                data[obs_key] = self._read_episode_mp4_frames(session, stem, mask)
 
         if len(self._episode_cache) >= _EPISODE_CACHE_SIZE:
             self._episode_cache.popitem(last=False)

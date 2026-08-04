@@ -75,6 +75,24 @@ def _wait_stream(device: torch.device, stream) -> None:
         torch.xpu.current_stream(device).wait_stream(stream)
 
 
+def _record_current_stream(batch: Any, device: torch.device) -> None:
+    """Keep side-stream allocations alive through main-stream consumption."""
+    if device.type == "cuda":
+        stream = torch.cuda.current_stream(device)
+    elif device.type == "xpu":
+        stream = torch.xpu.current_stream(device)
+    else:
+        return
+    if isinstance(batch, torch.Tensor):
+        batch.record_stream(stream)
+    elif isinstance(batch, dict):
+        for value in batch.values():
+            _record_current_stream(value, device)
+    elif isinstance(batch, (list, tuple)):
+        for value in batch:
+            _record_current_stream(value, device)
+
+
 def _stream_context(device: torch.device, stream):
     """Return the stream context-manager for *device*."""
     if device.type == "cuda":
@@ -154,8 +172,19 @@ class DataPrefetcher:
         Kicks off H2D for batch N+1 on a dedicated side stream while the main
         stream processes batch N.  ``wait_stream`` ensures the main stream only
         reads a batch after its H2D is complete — no full device sync needed.
+
+        A ``num_workers=0`` DataLoader normally constructs the next CPU batch
+        synchronously when this generator resumes, leaving the accelerator
+        idle before the side-stream copy can begin. In that mode a small
+        producer thread supplies pinned CPU batches one step ahead. This avoids
+        multiprocessing/IPC for very large image batches while overlapping the
+        vectorized host gather with the current model update.
         """
-        it = iter(self.loader)
+        it = (
+            self._threaded_loader_iter()
+            if getattr(self.loader, "num_workers", 0) == 0
+            else iter(self.loader)
+        )
         try:
             first = next(it)
         except StopIteration:
@@ -167,6 +196,7 @@ class DataPrefetcher:
         for raw in it:
             _wait_stream(self.device, self._stream)
             batch_gpu = next_gpu
+            _record_current_stream(batch_gpu, self.device)
 
             with _stream_context(self.device, self._stream):
                 next_gpu = _to_device(raw, self.device, self.non_blocking)
@@ -174,7 +204,49 @@ class DataPrefetcher:
             yield batch_gpu
 
         _wait_stream(self.device, self._stream)
+        _record_current_stream(next_gpu, self.device)
         yield next_gpu
+
+    def _threaded_loader_iter(self):
+        """Iterate a single-process DataLoader on a bounded producer thread."""
+        batches: queue.Queue = queue.Queue(maxsize=2)
+        stop = threading.Event()
+
+        def put(item: Any) -> bool:
+            while not stop.is_set():
+                try:
+                    batches.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def producer():
+            try:
+                for batch in self.loader:
+                    if not put(batch):
+                        return
+            except Exception as exc:  # noqa: BLE001
+                put(exc)
+                return
+            put(_DONE)
+
+        thread = threading.Thread(
+            target=producer,
+            daemon=True,
+            name="robo-dataset-prefetch",
+        )
+        thread.start()
+        try:
+            while True:
+                item = batches.get()
+                if item is _DONE:
+                    return
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            stop.set()
 
     def _thread_iter(self):
         """Background-thread prefetch for MPS and other devices.

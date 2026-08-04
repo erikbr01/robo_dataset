@@ -31,7 +31,7 @@ class ImageToTensorDevice(GPUBatchTransform):
     """
 
     def __init__(self, image_keys: List[str]):
-        self.image_keys = set(image_keys)
+        self.image_keys = tuple(dict.fromkeys(image_keys))
 
     @torch.no_grad()
     def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -77,7 +77,7 @@ class RandomCrop(GPUBatchTransform):
         pad: int = 4,
         per_timestep: bool = False,
     ):
-        self.image_keys = set(image_keys)
+        self.image_keys = tuple(dict.fromkeys(image_keys))
         self.size = size
         self.pad = pad
         self.per_timestep = per_timestep
@@ -121,7 +121,7 @@ class CenterCrop(GPUBatchTransform):
     counterpart of :class:`RandomCrop`. No-op when already at target size."""
 
     def __init__(self, image_keys: List[str], size: Tuple[int, int]):
-        self.image_keys = set(image_keys)
+        self.image_keys = tuple(dict.fromkeys(image_keys))
         self.size = size
 
     @torch.no_grad()
@@ -158,7 +158,7 @@ class Resize(GPUBatchTransform):
     """
 
     def __init__(self, image_keys: List[str], size: Tuple[int, int]):
-        self.image_keys = set(image_keys)
+        self.image_keys = tuple(dict.fromkeys(image_keys))
         self.size = size
 
     @torch.no_grad()
@@ -193,7 +193,7 @@ class ColorJitter(GPUBatchTransform):
         contrast: float = 0.1,
         saturation: float = 0.1,
     ):
-        self.image_keys = set(image_keys)
+        self.image_keys = tuple(dict.fromkeys(image_keys))
         self.brightness = brightness
         self.contrast = contrast
         self.saturation = saturation
@@ -239,7 +239,7 @@ class ChannelsLastGPU(GPUBatchTransform):
     """
 
     def __init__(self, image_keys: List[str]):
-        self.image_keys = set(image_keys)
+        self.image_keys = tuple(dict.fromkeys(image_keys))
 
     @torch.no_grad()
     def __call__(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

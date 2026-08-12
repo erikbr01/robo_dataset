@@ -1,4 +1,4 @@
-"""Read-only LeRobot v2 backend (parquet + per-episode MP4).
+"""Read-only LeRobot v2 / v3 backend (parquet + MP4).
 
 LeRobot v2 layout:
   <root>/meta/info.json        features, fps, data_path / video_path templates
@@ -7,6 +7,16 @@ LeRobot v2 layout:
                                concatenated state/action vectors and video key map
   <root>/data/chunk-XXX/episode_XXXXXX.parquet
   <root>/videos/chunk-XXX/<video_key>/episode_XXXXXX.mp4
+
+LeRobot v3 layout (auto-detected) packs many episodes per file instead:
+  <root>/meta/episodes/chunk-XXX/file-XXXXX.parquet   one ROW per episode, with
+      episode_index, length, data/{chunk,file}_index, dataset_{from,to}_index,
+      videos/<key>/{chunk,file}_index, videos/<key>/{from,to}_timestamp
+  <root>/data/chunk-XXX/file-XXXXX.parquet            episodes concatenated
+  <root>/videos/<video_key>/chunk-XXX/file-XXXXX.mp4  episodes concatenated;
+      an episode starts at round(from_timestamp * fps) within the file.
+The two differ only in how an episode is addressed, so the v3 support here is
+confined to episode metadata, path resolution, and a frame/row offset.
 
 Exposed keys:
   - video features:  "video.<name>" when modality.json exists, else the raw
@@ -45,12 +55,30 @@ class LeRobotStore(TrajectoryStore):
         with open(os.path.join(meta_dir, "info.json")) as f:
             self._info = json.load(f)
 
-        self._episode_lengths: List[int] = []
-        with open(os.path.join(meta_dir, "episodes.jsonl")) as f:
-            episodes = [json.loads(line) for line in f if line.strip()]
-        episodes.sort(key=lambda e: e["episode_index"])
-        self._episode_lengths = [int(e["length"]) for e in episodes]
+        # v2 keeps one JSON line per episode; v3 replaced that with a parquet
+        # table under meta/episodes/ (one row per episode).
+        episodes_jsonl = os.path.join(meta_dir, "episodes.jsonl")
+        episodes_dir = os.path.join(meta_dir, "episodes")
+        self._v3 = not os.path.exists(episodes_jsonl) and os.path.isdir(episodes_dir)
+        if self._v3:
+            self._ep_meta = self._read_v3_episode_meta(episodes_dir)
+        else:
+            with open(episodes_jsonl) as f:
+                episodes = [json.loads(line) for line in f if line.strip()]
+            episodes.sort(key=lambda e: e["episode_index"])
+            self._ep_meta = episodes
+        self._episode_lengths: List[int] = [int(e["length"]) for e in self._ep_meta]
         self._episode_ends = np.cumsum(self._episode_lengths).astype(np.int64)
+        self._fps = float(self._info.get("fps") or 0.0)
+        if self._v3 and not self._fps:
+            raise ValueError(
+                f"{path}: LeRobot v3 needs 'fps' in meta/info.json to locate an "
+                "episode's first frame inside a packed video file"
+            )
+        # v3 only: (path -> {column: ndarray}) for the packed parquet currently in
+        # use. Episodes are read in order, so a single slot avoids re-reading a
+        # multi-hundred-megabyte file once per episode.
+        self._v3_file_cache: Optional[Tuple[str, Dict[str, np.ndarray]]] = None
 
         modality_path = os.path.join(meta_dir, "modality.json")
         self._modality: Optional[dict] = None
@@ -119,7 +147,7 @@ class LeRobotStore(TrajectoryStore):
         # bookkeeping columns like episode_index / frame_index / timestamp).
         for col, attr in self._parquet_features.items():
             shape = tuple(attr.get("shape") or ())
-            if len(shape) != 1 or col in ("timestamp",) or col.endswith("_index"):
+            if len(shape) != 1 or col in ("timestamp", "index") or col.endswith("_index"):
                 continue
             self._parquet_key_map[col] = (col, 0, None)
             self._shapes[col] = shape
@@ -166,6 +194,31 @@ class LeRobotStore(TrajectoryStore):
         return self._schemas
 
     @staticmethod
+    def _missing_cols(table, cols, parquet_path: str) -> None:
+        missing = [c for c in cols if c not in table.column_names]
+        if missing:
+            raise KeyError(
+                f"Columns {missing!r} (mapped from store keys) are missing from "
+                f"parquet file {parquet_path!r}"
+            )
+
+    @staticmethod
+    def _read_v3_episode_meta(episodes_dir: str) -> List[dict]:
+        """One dict per episode from meta/episodes/**.parquet, ordered by index."""
+        import glob as _glob
+
+        import pyarrow.parquet as pq
+
+        files = sorted(_glob.glob(os.path.join(episodes_dir, "**", "*.parquet"), recursive=True))
+        if not files:
+            raise FileNotFoundError(f"no episode metadata parquet under {episodes_dir!r}")
+        rows: List[dict] = []
+        for f in files:
+            rows.extend(pq.read_table(f).to_pylist())
+        rows.sort(key=lambda e: int(e["episode_index"]))
+        return rows
+
+    @staticmethod
     def _video_shape(attr: dict) -> Tuple[int, int, int]:
         shape = list(attr["shape"])
         names = attr.get("names") or []
@@ -204,18 +257,39 @@ class LeRobotStore(TrajectoryStore):
         return ep_idx // self._chunks_size
 
     def _parquet_path(self, ep_idx: int) -> str:
+        if self._v3:
+            row = self._ep_meta[ep_idx]
+            rel = self._data_path_tpl.format(
+                chunk_index=int(row["data/chunk_index"]),
+                file_index=int(row["data/file_index"]),
+            )
+            return os.path.join(self.path, rel)
         rel = self._data_path_tpl.format(
             episode_chunk=self._episode_chunk(ep_idx), episode_index=ep_idx
         )
         return os.path.join(self.path, rel)
 
     def _video_path(self, ep_idx: int, feat: str) -> str:
+        if self._v3:
+            row = self._ep_meta[ep_idx]
+            rel = self._video_path_tpl.format(
+                video_key=feat,
+                chunk_index=int(row[f"videos/{feat}/chunk_index"]),
+                file_index=int(row[f"videos/{feat}/file_index"]),
+            )
+            return os.path.join(self.path, rel)
         rel = self._video_path_tpl.format(
             episode_chunk=self._episode_chunk(ep_idx),
             episode_index=ep_idx,
             video_key=feat,
         )
         return os.path.join(self.path, rel)
+
+    def _video_frame_offset(self, ep_idx: int, feat: str) -> int:
+        """Index of the episode's first frame inside its (v3-packed) video file."""
+        if not self._v3:
+            return 0
+        return int(round(float(self._ep_meta[ep_idx][f"videos/{feat}/from_timestamp"]) * self._fps))
 
     # ── Parquet reads ─────────────────────────────────────────────────────────
 
@@ -227,16 +301,32 @@ class LeRobotStore(TrajectoryStore):
             return cached
         import pyarrow.parquet as pq
         parquet_path = self._parquet_path(ep_idx)
-        table = pq.read_table(parquet_path)
-        data: Dict[str, np.ndarray] = {}
-        for col, _, _ in set(self._parquet_key_map.values()):
-            if col not in table.column_names:
-                raise KeyError(
-                    f"Column {col!r} (mapped from store keys) is missing from "
-                    f"parquet file {parquet_path!r}"
+        cols = {col for col, _, _ in self._parquet_key_map.values()}
+        if self._v3:
+            # The file holds many episodes back to back; read it once, then take
+            # this episode's contiguous row range.
+            if self._v3_file_cache is None or self._v3_file_cache[0] != parquet_path:
+                table = pq.read_table(parquet_path)
+                self._missing_cols(table, cols, parquet_path)
+                cached = {c: np.asarray(table.column(c).to_pylist(), dtype=np.float32)
+                          for c in cols}
+                cached["__episode_index__"] = np.asarray(
+                    table.column("episode_index").to_pylist()
+                ).reshape(-1)
+                self._v3_file_cache = (parquet_path, cached)
+            file_cols = self._v3_file_cache[1]
+            rows = np.flatnonzero(file_cols["__episode_index__"] == ep_idx)
+            if rows.size != self._episode_lengths[ep_idx]:
+                raise ValueError(
+                    f"{parquet_path!r}: episode {ep_idx} has {rows.size} rows but "
+                    f"metadata says {self._episode_lengths[ep_idx]}"
                 )
-            cells = table.column(col).to_pylist()
-            data[col] = np.asarray(cells, dtype=np.float32)
+            lo, hi = int(rows[0]), int(rows[-1]) + 1
+            data = {c: file_cols[c][lo:hi] for c in cols}
+        else:
+            table = pq.read_table(parquet_path)
+            self._missing_cols(table, cols, parquet_path)
+            data = {c: np.asarray(table.column(c).to_pylist(), dtype=np.float32) for c in cols}
         if len(self._episode_cache) >= _EPISODE_CACHE_SIZE:
             self._episode_cache.popitem(last=False)
         self._episode_cache[ep_idx] = data
@@ -246,12 +336,18 @@ class LeRobotStore(TrajectoryStore):
 
     def _decode_frames(self, key: str, ep_idx: int, local_indices: List[int]) -> np.ndarray:
         self._check_fork()
-        cache_key = (key, ep_idx)
+        feat = self._video_key_map[key]
+        video_path = self._video_path(ep_idx, feat)
+        # v3 packs many episodes per file, so the decoder is shared per FILE (not
+        # per episode) and indices are shifted to the episode's start.
+        cache_key = (key, video_path) if self._v3 else (key, ep_idx)
         dec = self._decoder_cache.get(cache_key)
         if dec is None:
-            feat = self._video_key_map[key]
-            dec = _DECODER_CLS[_pick_decoder_backend()](self._video_path(ep_idx, feat))
+            dec = _DECODER_CLS[_pick_decoder_backend()](video_path)
             self._decoder_cache.put(cache_key, dec)
+        offset = self._video_frame_offset(ep_idx, feat)
+        if offset:
+            local_indices = [i + offset for i in local_indices]
         return dec.get_frames(local_indices)
 
     # ── get_sequence ──────────────────────────────────────────────────────────

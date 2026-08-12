@@ -197,3 +197,143 @@ class TestLeRobotStore:
         np.testing.assert_allclose(out.get_sequence("action", 0, n), ref["action"])
         psnr = _psnr(out.get_sequence("video.cam", 0, n), ref["video.cam"])
         assert psnr >= 26.0, f"re-encoded PSNR {psnr:.1f} dB too low"
+
+
+# ── LeRobot v3 ────────────────────────────────────────────────────────────────
+# v3 packs every episode into shared parquet/mp4 files and addresses them via
+# meta/episodes/*.parquet (dataset_{from,to}_index + per-camera from_timestamp),
+# so these cover the offset arithmetic v2 never exercises. No modality.json here
+# (the common non-GR00T case) => keys are the raw feature names.
+
+V3_FPS = 10
+
+
+@pytest.fixture(scope="session")
+def lerobot_v3_dataset(tmp_path_factory):
+    import av
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = tmp_path_factory.mktemp("lerobot_v3")
+    rng = np.random.default_rng(11)
+    video_feat = "top_camera-images-rgb"
+    ref = {video_feat: [], "state": [], "actions": []}
+
+    os.makedirs(root / "meta" / "episodes" / "chunk-000")
+    rows, ep_rows, cursor = [], [], 0
+    for ep, T in enumerate(EP_LENGTHS):
+        state = rng.standard_normal((T, STATE_DIM)).astype(np.float32)
+        action = rng.standard_normal((T, ACTION_DIM)).astype(np.float32)
+        frames = _smooth_frames(ep, T)
+        ref["state"].append(state)
+        ref["actions"].append(action)
+        ref[video_feat].append(frames)
+        rows.append((state, action, ep, T))
+        ep_rows.append({
+            "episode_index": ep, "length": T,
+            "data/chunk_index": 0, "data/file_index": 0,
+            "dataset_from_index": cursor, "dataset_to_index": cursor + T,
+            f"videos/{video_feat}/chunk_index": 0,
+            f"videos/{video_feat}/file_index": 0,
+            f"videos/{video_feat}/from_timestamp": cursor / V3_FPS,
+            f"videos/{video_feat}/to_timestamp": (cursor + T) / V3_FPS,
+        })
+        cursor += T
+
+    # one parquet holding every episode, back to back
+    os.makedirs(root / "data" / "chunk-000")
+    pq.write_table(
+        pa.table({
+            "state": [r.tolist() for s, _, _, _ in rows for r in s],
+            "actions": [r.tolist() for _, a, _, _ in rows for r in a],
+            "episode_index": [ep for _, _, ep, T in rows for _ in range(T)],
+            "frame_index": [t for _, _, _, T in rows for t in range(T)],
+            "timestamp": [t / V3_FPS for _, _, _, T in rows for t in range(T)],
+        }),
+        root / "data" / "chunk-000" / "file-00000.parquet",
+    )
+
+    # one mp4 holding every episode, back to back
+    vid_dir = root / "videos" / video_feat / "chunk-000"
+    os.makedirs(vid_dir)
+    container = av.open(str(vid_dir / "file-00000.mp4"), "w")
+    stream = container.add_stream("libx264", rate=V3_FPS)
+    stream.width, stream.height, stream.pix_fmt = W, H, "yuv420p"
+    stream.options = {"crf": "18", "g": "1", "preset": "fast"}
+    for frames in ref[video_feat]:
+        for arr in frames:
+            for pkt in stream.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")):
+                container.mux(pkt)
+    for pkt in stream.encode():
+        container.mux(pkt)
+    container.close()
+
+    pq.write_table(
+        pa.Table.from_pylist(ep_rows),
+        root / "meta" / "episodes" / "chunk-000" / "file-00000.parquet",
+    )
+    with open(root / "meta" / "info.json", "w") as f:
+        json.dump({
+            "codebase_version": "v3.0",
+            "fps": V3_FPS,
+            "total_episodes": N_EPISODES,
+            "total_frames": int(sum(EP_LENGTHS)),
+            "chunks_size": 1000,
+            "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:05d}.parquet",
+            "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:05d}.mp4",
+            "features": {
+                video_feat: {"dtype": "video", "shape": [H, W, C],
+                             "names": ["height", "width", "channels"]},
+                "state": {"dtype": "float32", "shape": [STATE_DIM]},
+                "actions": {"dtype": "float32", "shape": [ACTION_DIM]},
+                "episode_index": {"dtype": "int64", "shape": [1]},
+                "frame_index": {"dtype": "int64", "shape": [1]},
+                "timestamp": {"dtype": "float32", "shape": [1]},
+            },
+        }, f)
+
+    return str(root), {k: np.concatenate(v) for k, v in ref.items()}, video_feat
+
+
+class TestLeRobotStoreV3:
+    def test_detected_and_metadata(self, lerobot_v3_dataset):
+        from robo_dataset.store_factory import detect_format, open_store
+        root, ref, video_feat = lerobot_v3_dataset
+        assert detect_format(root) == "lerobot"
+        store = open_store(root)
+        assert store._v3 is True
+        assert store.n_episodes == N_EPISODES
+        np.testing.assert_array_equal(store.episode_ends, np.cumsum(EP_LENGTHS))
+        assert store.frame_shape(video_feat) == (H, W, C)
+        assert store.frame_shape("state") == (STATE_DIM,)
+        # bookkeeping columns stay out of the key list
+        assert "index" not in store.keys and "timestamp" not in store.keys
+
+    def test_packed_parquet_exact(self, lerobot_v3_dataset):
+        from robo_dataset.backends.lerobot import LeRobotStore
+        root, ref, _ = lerobot_v3_dataset
+        store = LeRobotStore(root)
+        n = store.n_frames
+        np.testing.assert_allclose(store.get_sequence("state", 0, n), ref["state"])
+        np.testing.assert_allclose(store.get_sequence("actions", 0, n), ref["actions"])
+
+    def test_packed_video_offsets(self, lerobot_v3_dataset):
+        """Each episode must start at its own from_timestamp inside the shared mp4."""
+        from robo_dataset.backends.lerobot import LeRobotStore
+        root, ref, video_feat = lerobot_v3_dataset
+        store = LeRobotStore(root)
+        starts = np.concatenate([[0], np.cumsum(EP_LENGTHS)[:-1]])
+        for ep, T in enumerate(EP_LENGTHS):
+            a = int(starts[ep])
+            got = store.get_sequence(video_feat, a, a + T)
+            psnr = _psnr(got, ref[video_feat][a:a + T])
+            assert psnr >= 28.0, f"ep{ep} decode PSNR {psnr:.1f} dB (wrong offset?)"
+
+    def test_cross_episode_read(self, lerobot_v3_dataset):
+        from robo_dataset.backends.lerobot import LeRobotStore
+        root, ref, video_feat = lerobot_v3_dataset
+        store = LeRobotStore(root)
+        start, end = EP_LENGTHS[0] - 3, EP_LENGTHS[0] + 3
+        np.testing.assert_allclose(
+            store.get_sequence("actions", start, end), ref["actions"][start:end])
+        assert store.get_sequence(video_feat, start, end).shape == (6, H, W, C)

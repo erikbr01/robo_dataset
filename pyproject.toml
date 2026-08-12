@@ -24,6 +24,9 @@ dependencies = [
 
 [project.optional-dependencies]
 video = ["torchcodec"]
+# backends/lerobot.py reads parquet (episode metadata + frame columns) via
+# pyarrow; without it the LeRobot backend raises ModuleNotFoundError on open.
+lerobot = ["pyarrow"]
 dev = ["pytest", "pytest-xdist"]
 
 [tool.hatch.build.targets.wheel]

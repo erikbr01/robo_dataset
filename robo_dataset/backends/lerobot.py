@@ -338,9 +338,13 @@ class LeRobotStore(TrajectoryStore):
         self._check_fork()
         feat = self._video_key_map[key]
         video_path = self._video_path(ep_idx, feat)
-        # v3 packs many episodes per file, so the decoder is shared per FILE (not
-        # per episode) and indices are shifted to the episode's start.
-        cache_key = (key, video_path) if self._v3 else (key, ep_idx)
+        # Keyed per (key, episode) even under v3, where many episodes share one
+        # file: callers decode several episodes CONCURRENTLY (rgrl's
+        # EpisodeStore.load fans out over ~16 threads), and the decoder cache is
+        # only documented thread-safe when each episode has its own decoder.
+        # Sharing one per file segfaults every worker. Episodes on the same file
+        # therefore open separate decoders over it, bounded by max_decoders.
+        cache_key = (key, ep_idx)
         dec = self._decoder_cache.get(cache_key)
         if dec is None:
             dec = _DECODER_CLS[_pick_decoder_backend()](video_path)

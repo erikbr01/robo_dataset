@@ -49,14 +49,25 @@ from .video import _DECODER_CLS, _LRUDecoderCache, _pick_decoder_backend
 
 _DEFAULT_MAX_DECODERS = 32
 _EPISODE_CACHE_SIZE = 4  # parquet episodes kept in RAM per worker
-_V3_FILE_CACHE_SIZE = 2  # packed v3 data files kept in RAM per worker
+# Packed v3 data files kept in RAM per worker. Two rather than one because an
+# episode range routinely straddles a file boundary; each entry is the whole
+# file's float columns, so raise it only if you know they fit.
+_V3_FILE_CACHE_SIZE = 2
 
 
 class LeRobotStore(TrajectoryStore):
     """Read-only flat-frame view over a LeRobot v2 dataset."""
 
-    def __init__(self, path: str, max_decoders: int = _DEFAULT_MAX_DECODERS):
+    def __init__(
+        self,
+        path: str,
+        max_decoders: int = _DEFAULT_MAX_DECODERS,
+        max_cached_files: int = _V3_FILE_CACHE_SIZE,
+    ):
         self.path = path
+        if max_cached_files < 1:
+            raise ValueError(f"max_cached_files must be >= 1, got {max_cached_files}")
+        self._max_cached_files = int(max_cached_files)
         meta_dir = os.path.join(path, "meta")
 
         with open(os.path.join(meta_dir, "info.json")) as f:
@@ -90,6 +101,8 @@ class LeRobotStore(TrajectoryStore):
         self._v3_file_cache: "OrderedDict[str, Dict[str, np.ndarray]]" = OrderedDict()
         # Per-path load lock: the first thread to want a file reads it while the
         # others block, instead of every thread reading the same file at once.
+        # Never pruned — a waiting thread may hold one — but it is bounded by
+        # the data file count, which v3 keeps small by packing episodes.
         self._v3_load_locks: Dict[str, threading.Lock] = {}
 
         modality_path = os.path.join(meta_dir, "modality.json")
@@ -236,11 +249,23 @@ class LeRobotStore(TrajectoryStore):
                 arr.chunk(0) if arr.num_chunks == 1
                 else pa.concat_arrays(list(arr.iterchunks()))
             )
+        # A null would shift every subsequent row, and flatten() drops it
+        # silently rather than raising. LeRobot exports do not produce nulls;
+        # say so loudly instead of returning misaligned frames.
+        if arr.null_count:
+            raise ValueError(
+                f"column has {arr.null_count} null value(s); LeRobot frame "
+                "columns must be dense"
+            )
         if pa.types.is_list(arr.type) or pa.types.is_large_list(arr.type) \
                 or pa.types.is_fixed_size_list(arr.type):
             n = len(arr)
             flat = arr.flatten().to_numpy(zero_copy_only=False)
             flat = flat.astype(np.float32, copy=False)
+            if n and flat.size % n:
+                raise ValueError(
+                    f"ragged list column: {flat.size} values across {n} rows"
+                )
             return flat.reshape(n, -1) if n else flat.reshape(0, 0)
         # Scalar column: matches the 1-D shape the v2 path has always returned.
         return arr.to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
@@ -353,10 +378,29 @@ class LeRobotStore(TrajectoryStore):
         return os.path.join(self.path, rel)
 
     def _video_frame_offset(self, ep_idx: int, feat: str) -> int:
-        """Index of the episode's first frame inside its (v3-packed) video file."""
+        """Index of the episode's first frame inside its (v3-packed) video file.
+
+        A wrong offset here decodes a different episode's frames and looks like
+        perfectly valid data, so cross-check it against to_timestamp when the
+        metadata carries one. One frame of slack absorbs float rounding at large
+        offsets; being off by a whole episode is what this is for.
+        """
         if not self._v3:
             return 0
-        return int(round(float(self._ep_meta[ep_idx][f"videos/{feat}/from_timestamp"]) * self._fps))
+        row = self._ep_meta[ep_idx]
+        offset = int(round(float(row[f"videos/{feat}/from_timestamp"]) * self._fps))
+        to_ts = row.get(f"videos/{feat}/to_timestamp")
+        if to_ts is not None:
+            spanned = int(round(float(to_ts) * self._fps)) - offset
+            expected = self._episode_lengths[ep_idx]
+            if abs(spanned - expected) > 1:
+                raise ValueError(
+                    f"{self.path}: episode {self._episode_label(ep_idx)} camera "
+                    f"{feat!r} spans {spanned} frames between its from/to "
+                    f"timestamps but metadata says {expected}; refusing to "
+                    "decode from a frame offset that cannot be right"
+                )
+        return offset
 
     # ── Parquet reads ─────────────────────────────────────────────────────────
 
@@ -388,7 +432,7 @@ class LeRobotStore(TrajectoryStore):
             with self._cache_lock:
                 self._v3_file_cache[parquet_path] = file_cols
                 self._v3_file_cache.move_to_end(parquet_path)
-                while len(self._v3_file_cache) > _V3_FILE_CACHE_SIZE:
+                while len(self._v3_file_cache) > self._max_cached_files:
                     self._v3_file_cache.popitem(last=False)
             return file_cols
 

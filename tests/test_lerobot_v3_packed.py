@@ -23,8 +23,16 @@ LENGTHS = [7, 11, 5, 9, 13, 6, 8, 10]
 EPS_PER_FILE = 3  # => 3 data files
 
 
-def _write_v3(root, lengths, labels, eps_per_file):
-    """Minimal video-less v3 layout; returns {label: (state, action)}."""
+VIDEO_FEAT = "cam"
+
+
+def _write_v3(root, lengths, labels, eps_per_file, video=False, bad_to_timestamp=False):
+    """Minimal v3 layout; returns {label: (state, action)}.
+
+    With video=True the episode metadata gains the camera columns (no mp4 is
+    written — the offset arithmetic is checked directly, which keeps this
+    module PyAV-free).
+    """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -33,19 +41,30 @@ def _write_v3(root, lengths, labels, eps_per_file):
     rng = np.random.default_rng(23)
 
     ref, ep_rows, files = {}, [], {}
+    cursor = 0
     for pos, (label, T) in enumerate(zip(labels, lengths)):
         state = rng.standard_normal((T, STATE_DIM)).astype(np.float32)
         action = rng.standard_normal((T, ACTION_DIM)).astype(np.float32)
         ref[label] = (state, action)
         file_index = pos // eps_per_file
         files.setdefault(file_index, []).append((label, state, action))
-        ep_rows.append({
+        row = {
             "episode_index": label, "length": T,
             "data/chunk_index": 0, "data/file_index": file_index,
             # stats/* is the bulk of a real meta table and must not be read
             "stats/state/mean": state.mean(0).tolist(),
             "stats/actions/mean": action.mean(0).tolist(),
-        })
+        }
+        if video:
+            span = T + (5 if bad_to_timestamp else 0)
+            row.update({
+                f"videos/{VIDEO_FEAT}/chunk_index": 0,
+                f"videos/{VIDEO_FEAT}/file_index": 0,
+                f"videos/{VIDEO_FEAT}/from_timestamp": cursor / FPS,
+                f"videos/{VIDEO_FEAT}/to_timestamp": (cursor + span) / FPS,
+            })
+        ep_rows.append(row)
+        cursor += T
 
     for file_index, eps in files.items():
         state = np.concatenate([e[1] for e in eps])
@@ -65,17 +84,23 @@ def _write_v3(root, lengths, labels, eps_per_file):
         pa.Table.from_pylist(ep_rows),
         os.path.join(root, "meta", "episodes", "chunk-000", "file-00000.parquet"),
     )
+    features = {
+        "state": {"dtype": "float32", "shape": [STATE_DIM]},
+        "actions": {"dtype": "float32", "shape": [ACTION_DIM]},
+        "episode_index": {"dtype": "int64", "shape": [1]},
+        "frame_index": {"dtype": "int64", "shape": [1]},
+        "timestamp": {"dtype": "float32", "shape": [1]},
+    }
+    if video:
+        features[VIDEO_FEAT] = {"dtype": "video", "shape": [16, 16, 3],
+                                "names": ["height", "width", "channels"]}
     with open(os.path.join(root, "meta", "info.json"), "w") as f:
         json.dump({
             "codebase_version": "v3.0", "fps": FPS, "chunks_size": 1000,
             "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:05d}.parquet",
-            "features": {
-                "state": {"dtype": "float32", "shape": [STATE_DIM]},
-                "actions": {"dtype": "float32", "shape": [ACTION_DIM]},
-                "episode_index": {"dtype": "int64", "shape": [1]},
-                "frame_index": {"dtype": "int64", "shape": [1]},
-                "timestamp": {"dtype": "float32", "shape": [1]},
-            },
+            "video_path":
+                "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:05d}.mp4",
+            "features": features,
         }, f)
     return ref
 
@@ -174,6 +199,64 @@ class TestPackedParquetReads:
 
         with pytest.raises(ValueError, match="rows but"):
             LeRobotStore(root).get_sequence("actions", 4, 8)
+
+
+class TestLoudFailures:
+    """Bad inputs on this path produce plausible-looking arrays, not exceptions,
+    unless something checks for them."""
+
+    def test_null_values_are_rejected(self, tmp_path):
+        """flatten() drops nulls silently, shifting every row after them."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from robo_dataset.backends.lerobot import LeRobotStore
+        root = str(tmp_path / "nulls")
+        _write_v3(root, [4, 4], [0, 1], eps_per_file=2)
+        path = os.path.join(root, "data", "chunk-000", "file-00000.parquet")
+        table = pq.read_table(path)
+        holed = pa.array([None] + table.column("state").to_pylist()[1:],
+                         pa.list_(pa.float32()))
+        pq.write_table(table.set_column(
+            table.schema.get_field_index("state"), "state", holed), path)
+
+        with pytest.raises(ValueError, match="null"):
+            LeRobotStore(root).get_sequence("state", 0, 4)
+
+    def test_video_offset_inconsistent_with_length_is_rejected(self, tmp_path):
+        """A from_timestamp that disagrees with length decodes another episode."""
+        from robo_dataset.backends.lerobot import LeRobotStore
+        root = str(tmp_path / "badts")
+        _write_v3(root, [6, 6], [0, 1], eps_per_file=2,
+                  video=True, bad_to_timestamp=True)
+        store = LeRobotStore(root)
+        with pytest.raises(ValueError, match="cannot be right"):
+            store._video_frame_offset(0, VIDEO_FEAT)
+
+    def test_video_offset_accepted_when_consistent(self, tmp_path):
+        from robo_dataset.backends.lerobot import LeRobotStore
+        root = str(tmp_path / "goodts")
+        lengths = [6, 7, 5]
+        _write_v3(root, lengths, [0, 1, 2], eps_per_file=3, video=True)
+        store = LeRobotStore(root)
+        starts = [0] + list(np.cumsum(lengths)[:-1])
+        for pos, start in enumerate(starts):
+            assert store._video_frame_offset(pos, VIDEO_FEAT) == start
+
+
+class TestCacheSizing:
+    def test_max_cached_files_is_configurable(self, packed_v3):
+        from robo_dataset.backends.lerobot import LeRobotStore
+        root, _, _, lengths = packed_v3
+        store = LeRobotStore(root, max_cached_files=1)
+        for lo, hi in _episode_bounds(lengths):
+            store.get_sequence("state", lo, hi)
+        assert len(store._v3_file_cache) == 1
+
+    def test_max_cached_files_is_validated(self, packed_v3):
+        from robo_dataset.backends.lerobot import LeRobotStore
+        root, _, _, _ = packed_v3
+        with pytest.raises(ValueError, match="max_cached_files"):
+            LeRobotStore(root, max_cached_files=0)
 
 
 class TestNonContiguousEpisodeIndex:

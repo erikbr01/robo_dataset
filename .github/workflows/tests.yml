@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU torch
+        # The default index pulls the CUDA build (multi-GB, useless on a runner).
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install package and test dependencies
+        run: pip install -e ".[lerobot,dev]"
+
+      - name: Run tests
+        # Strict mode turns a missing optional package into a hard error, so the
+        # suite cannot go green by silently skipping the backends it covers.
+        # torchcodec is left out: it needs an ffmpeg/torch pairing that is not
+        # reliably installable here, and PyAV covers the same decode path.
+        env:
+          ROBO_DATASET_STRICT_DEPS: pyarrow,av,tfrecord,cv2
+        run: pytest tests/ -v --durations=10

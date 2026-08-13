@@ -1,10 +1,65 @@
 """Test fixtures: create small synthetic HDF5 and convert to other backends."""
 
+import collections
+
 import h5py
 import numpy as np
 import pytest
 
 from .constants import N_EPISODES, EP_LENGTHS, H, W, C, ACTION_DIM, OBS_KEYS, LOWDIM_KEY, LOWDIM_DIM
+from .optional_deps import OPTIONAL_DEPS, missing_deps, strictly_required
+
+
+# ── Optional dependencies: report always, enforce on request ──────────────────
+# Without this a suite that skipped every LeRobot test reads the same as one
+# that ran them. See tests/optional_deps.py.
+
+def pytest_configure(config):
+    missing = missing_deps()
+    try:
+        required = strictly_required()
+    except ValueError as exc:  # a typo must not surface as INTERNALERROR
+        raise pytest.UsageError(str(exc)) from None
+    blocking = [p for p in required if p in missing]
+    if blocking:
+        raise pytest.UsageError(
+            "ROBO_DATASET_STRICT_DEPS requires these packages, which are not "
+            "installed:\n"
+            + "".join(f"  - {p}: {OPTIONAL_DEPS[p]}\n" for p in blocking)
+            + "Install them, or unset the variable to allow skipping."
+        )
+    config._missing_optional_deps = missing
+
+
+def pytest_report_header(config):
+    missing = getattr(config, "_missing_optional_deps", [])
+    present = [p for p in OPTIONAL_DEPS if p not in missing]
+    lines = [f"optional deps present: {', '.join(present) or 'none'}"]
+    if missing:
+        lines.append(f"optional deps MISSING: {', '.join(missing)} "
+                     f"(tests needing them will skip)")
+    return lines
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Attribute skips to the package that caused them, so they stay visible."""
+    missing = getattr(config, "_missing_optional_deps", [])
+    if not missing:
+        return
+    counts = collections.Counter()
+    for report in terminalreporter.stats.get("skipped", []):
+        reason = str(getattr(report, "longrepr", ("", "", ""))[-1] or "")
+        for package in missing:
+            if package in reason:
+                counts[package] += 1
+                break
+    terminalreporter.write_sep("=", "optional dependencies", yellow=True)
+    for package in missing:
+        terminalreporter.write_line(
+            f"  {package} not installed -> {counts[package]} test(s) skipped"
+            f" | {OPTIONAL_DEPS[package]}", yellow=True)
+    terminalreporter.write_line(
+        "  set ROBO_DATASET_STRICT_DEPS=1 to make these a hard error", yellow=True)
 
 
 @pytest.fixture(scope="session")

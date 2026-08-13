@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 
 from .constants import N_EPISODES, EP_LENGTHS, H, W, C, ACTION_DIM, OBS_KEYS, LOWDIM_KEY, LOWDIM_DIM
-from .optional_deps import OPTIONAL_DEPS, missing_deps, strictly_required
+from .optional_deps import OPTIONAL_DEPS, describe, missing_deps, strictly_required
 
 
-# ── Optional dependencies: report always, enforce on request ──────────────────
+# ── Optional capabilities: report always, enforce on request ──────────────────
 # Without this a suite that skipped every LeRobot test reads the same as one
 # that ran them. See tests/optional_deps.py.
 
@@ -23,10 +23,11 @@ def pytest_configure(config):
     blocking = [p for p in required if p in missing]
     if blocking:
         raise pytest.UsageError(
-            "ROBO_DATASET_STRICT_DEPS requires these packages, which are not "
-            "installed:\n"
-            + "".join(f"  - {p}: {OPTIONAL_DEPS[p]}\n" for p in blocking)
-            + "Install them, or unset the variable to allow skipping."
+            "ROBO_DATASET_STRICT_DEPS requires these capabilities, which are "
+            "unavailable:\n"
+            + "".join(f"  - {describe(p)}: {OPTIONAL_DEPS[p].description}\n"
+                      for p in blocking)
+            + "Install/upgrade them, or unset the variable to allow skipping."
         )
     config._missing_optional_deps = missing
 
@@ -34,30 +35,31 @@ def pytest_configure(config):
 def pytest_report_header(config):
     missing = getattr(config, "_missing_optional_deps", [])
     present = [p for p in OPTIONAL_DEPS if p not in missing]
-    lines = [f"optional deps present: {', '.join(present) or 'none'}"]
+    lines = [f"optional capabilities present: {', '.join(present) or 'none'}"]
     if missing:
-        lines.append(f"optional deps MISSING: {', '.join(missing)} "
-                     f"(tests needing them will skip)")
+        lines.append("optional capabilities MISSING: "
+                     + "; ".join(describe(p) for p in missing)
+                     + " (tests needing them will skip)")
     return lines
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    """Attribute skips to the package that caused them, so they stay visible."""
+    """Attribute skips to the capability that caused them, so they stay visible."""
     missing = getattr(config, "_missing_optional_deps", [])
     if not missing:
         return
     counts = collections.Counter()
     for report in terminalreporter.stats.get("skipped", []):
         reason = str(getattr(report, "longrepr", ("", "", ""))[-1] or "")
-        for package in missing:
-            if package in reason:
-                counts[package] += 1
+        for name in missing:
+            if OPTIONAL_DEPS[name].skip_token in reason:
+                counts[name] += 1
                 break
-    terminalreporter.write_sep("=", "optional dependencies", yellow=True)
-    for package in missing:
+    terminalreporter.write_sep("=", "optional capabilities", yellow=True)
+    for name in missing:
         terminalreporter.write_line(
-            f"  {package} not installed -> {counts[package]} test(s) skipped"
-            f" | {OPTIONAL_DEPS[package]}", yellow=True)
+            f"  {describe(name)} -> {counts[name]} test(s) skipped"
+            f" | {OPTIONAL_DEPS[name].description}", yellow=True)
     terminalreporter.write_line(
         "  set ROBO_DATASET_STRICT_DEPS=1 to make these a hard error", yellow=True)
 

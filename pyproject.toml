@@ -24,7 +24,12 @@ dependencies = [
 
 [project.optional-dependencies]
 video = ["torchcodec"]
-dev = ["pytest", "pytest-xdist"]
+# backends/lerobot.py reads parquet (episode metadata + frame columns) via
+# pyarrow; without it the LeRobot backend raises ModuleNotFoundError on open.
+# av decodes the mp4 side when torchcodec is absent, and every LeRobot video
+# test needs it — a dev install without it silently skips the whole module.
+lerobot = ["pyarrow", "av"]
+dev = ["pytest", "pytest-xdist", "pyarrow", "av"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["robo_dataset"]

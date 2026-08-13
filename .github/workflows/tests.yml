@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # zarr 3 requires Python >= 3.11, so on 3.9 the dependency resolves to
+          # zarr 2.x and the sharded backend cannot be exercised at all. That is
+          # a real coverage hole in the declared support range, not a runner
+          # quirk — see the "zarr3" capability in tests/optional_deps.py.
+          - python-version: "3.9"
+            strict-deps: pyarrow,av,tfrecord,cv2
+          - python-version: "3.12"
+            strict-deps: pyarrow,av,tfrecord,cv2,zarr3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU torch
+        # The default index pulls the CUDA build (multi-GB, useless on a runner).
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install package and test dependencies
+        run: pip install -e ".[lerobot,dev]"
+
+      - name: Run tests
+        # Strict mode turns a missing optional package into a hard error, so the
+        # suite cannot go green by silently skipping the backends it covers.
+        # torchcodec is left out: it needs an ffmpeg/torch pairing that is not
+        # reliably installable here, and PyAV covers the same decode path.
+        env:
+          ROBO_DATASET_STRICT_DEPS: ${{ matrix.strict-deps }}
+        run: pytest tests/ -v --durations=10

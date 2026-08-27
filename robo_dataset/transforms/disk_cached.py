@@ -73,13 +73,34 @@ def apply_disk_cached(
 # ── Built-in disk transforms ──────────────────────────────────────────────────
 
 class ResizeImages(DiskCachedTransform):
-    """Resize all image keys to target_h × target_w using cv2.INTER_AREA."""
+    """Resize all image keys to target_h × target_w using cv2.INTER_AREA.
 
-    def __init__(self, image_keys: List[str], target_h: int, target_w: int, version: str = "1"):
+    By default the frame is stretched to exactly the target, which is fine when
+    every source frame already shares one aspect ratio. When a store mixes aspect
+    ratios it is not: stretching then distorts one group of episodes relative to
+    another, giving a policy a cue that has nothing to do with the task. ABC-130k
+    is such a store -- in its annotated bottles task, 28 of 40 episodes record at
+    848x480 (16:9) and 8 at 640x480 (4:3). Pass ``letterbox=True`` to scale to fit
+    and pad instead, which keeps objects the same shape everywhere and confines
+    the difference to the padding.
+    """
+
+    def __init__(self, image_keys: List[str], target_h: int, target_w: int,
+                 letterbox: bool = False, pad_value: int = 0, version: str = "1"):
         self.image_keys = image_keys
         self.target_h = target_h
         self.target_w = target_w
+        self.letterbox = bool(letterbox)
+        self.pad_value = int(pad_value)
         self.version = version
+
+    def _fit(self, h: int, w: int) -> tuple:
+        """Scaled size and top-left offset for a letterboxed frame."""
+        scale = min(self.target_h / h, self.target_w / w)
+        # round, not floor: floor can lose a pixel row on exact-fit sources.
+        sh = max(1, min(self.target_h, int(round(h * scale))))
+        sw = max(1, min(self.target_w, int(round(w * scale))))
+        return sh, sw, (self.target_h - sh) // 2, (self.target_w - sw) // 2
 
     def apply_episode(self, ep_data: Dict[str, Any]) -> Dict[str, Any]:
         import cv2
@@ -95,7 +116,14 @@ class ResizeImages(DiskCachedTransform):
             frames = ep_data[key]  # (T, H, W, C) uint8
             T = frames.shape[0]
             out = np.empty((T, self.target_h, self.target_w, frames.shape[3]), dtype=frames.dtype)
-            for t in range(T):
-                out[t] = cv2.resize(frames[t], (self.target_w, self.target_h), interpolation=cv2.INTER_AREA)
+            if not self.letterbox:
+                for t in range(T):
+                    out[t] = cv2.resize(frames[t], (self.target_w, self.target_h), interpolation=cv2.INTER_AREA)
+            else:
+                sh, sw, y0, x0 = self._fit(frames.shape[1], frames.shape[2])
+                out.fill(self.pad_value)
+                for t in range(T):
+                    out[t, y0:y0 + sh, x0:x0 + sw] = cv2.resize(
+                        frames[t], (sw, sh), interpolation=cv2.INTER_AREA)
             result[key] = out
         return result

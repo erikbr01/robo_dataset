@@ -60,16 +60,25 @@ def _jpeg_compressor() -> numcodecs.abc.Codec:
     except ImportError:
         pass
     try:
-        # numcodecs signals an unregistered codec with ValueError, not ImportError.
-        codec = numcodecs.registry.get_codec(
-            {"id": "imagecodecs_jpeg", "quality": _JPEG_QUALITY}
-        )
-        log.warning(
-            "Jpeg2k codec unavailable; using imagecodecs JPEG (lossy, quality=%d) "
-            "for image keys.", _JPEG_QUALITY,
-        )
-        return codec
-    except (ImportError, ValueError):
+        # imagecodecs does not register its codecs on import, so asking the
+        # numcodecs registry first would always miss. Registering is idempotent.
+        import imagecodecs.numcodecs as imagecodecs_numcodecs
+        imagecodecs_numcodecs.register_codecs(verbose=False)
+        # The quality kwarg was renamed `quality` -> `level`; try both so this
+        # works either side of that change instead of silently falling back.
+        for kwarg in ("level", "quality"):
+            try:
+                codec = numcodecs.registry.get_codec(
+                    {"id": "imagecodecs_jpeg", kwarg: _JPEG_QUALITY}
+                )
+            except (ValueError, TypeError):
+                continue
+            log.warning(
+                "Jpeg2k codec unavailable; using imagecodecs JPEG (lossy, "
+                "%s=%d) for image keys.", kwarg, _JPEG_QUALITY,
+            )
+            return codec
+    except (ImportError, ValueError, TypeError):
         pass
     log.warning(
         "No JPEG codec available (Jpeg2k / imagecodecs_jpeg); falling back to "

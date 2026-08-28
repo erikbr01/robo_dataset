@@ -222,3 +222,42 @@ def test_parallel_disk_cache_falls_back_when_not_indexed(caplog):
                                     td, workers=8)
     assert out.n_frames == 3
     assert any("not indexed" in r.getMessage() for r in caplog.records)
+
+
+class _StoreWithBadEpisode(_FakeIndexedStore):
+    """One episode is missing the image key entirely, as ABC episodes can be."""
+
+    def get_episode(self, i):
+        ep = super().get_episode(i)
+        if i == 3:
+            del ep["img"]
+        return ep
+
+
+def test_disk_cache_skip_keeps_going_and_reports_order(tmp_path):
+    """A ragged source must not destroy the whole build, and the surviving order
+    must be recoverable -- a positional hold-out built from range(n_episodes)
+    would be off by one for every episode after the skip."""
+    from robo_dataset.transforms import apply_disk_cached
+
+    tr = ResizeImages(["img"], target_h=4, target_w=4, letterbox=True)
+    kept = []
+    out = apply_disk_cached(_StoreWithBadEpisode(), tr, str(tmp_path / "skip"),
+                            image_keys=["img"], workers=3,
+                            on_error="skip", kept_out=kept)
+    assert kept == [0, 1, 2, 4, 5, 6]          # 3 dropped, order preserved
+    assert len(out.episode_ends) == 6
+    # state carries the episode id, so this proves *which* episodes survived
+    # rather than merely how many.
+    seen = out.get_sequence("state", 0, out.n_frames)[:, 0]
+    assert sorted(set(seen.tolist())) == [0.0, 1.0, 2.0, 4.0, 5.0, 6.0]
+
+
+def test_disk_cache_raises_by_default(tmp_path):
+    """Default stays strict: silently dropping episodes must be opt-in."""
+    from robo_dataset.transforms import apply_disk_cached
+
+    tr = ResizeImages(["img"], target_h=4, target_w=4, letterbox=True)
+    with pytest.raises(KeyError):
+        apply_disk_cached(_StoreWithBadEpisode(), tr, str(tmp_path / "strict"),
+                          image_keys=["img"], workers=3)

@@ -25,7 +25,16 @@ from .base import DiskCachedTransform
 log = logging.getLogger(__name__)
 
 
-def _episode_pipeline(source, transform, n_episodes: int, workers: int):
+class _EpisodeFailed:
+    """A sentinel carrying the failure, so the writer can skip in order."""
+
+    def __init__(self, index: int, error: BaseException):
+        self.index = index
+        self.error = error
+
+
+def _episode_pipeline(source, transform, n_episodes: int, workers: int,
+                      on_error: str = "raise"):
     """Yield transformed episodes in order, reading/transforming ahead in threads.
 
     The write side cannot be parallelised: `ZarrStoreWriter.put_episode` appends,
@@ -42,7 +51,12 @@ def _episode_pipeline(source, transform, n_episodes: int, workers: int):
     from concurrent.futures import ThreadPoolExecutor
 
     def one(i):
-        return transform.apply_episode(source.get_episode(i))
+        if on_error == "skip":
+            try:
+                return i, transform.apply_episode(source.get_episode(i))
+            except Exception as e:  # noqa: BLE001 - reported, then skipped
+                return i, _EpisodeFailed(i, e)
+        return i, transform.apply_episode(source.get_episode(i))
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = collections.deque()
@@ -66,6 +80,8 @@ def apply_disk_cached(
     writer_cls: Type[WritableTrajectoryStore] = ZarrStoreWriter,
     force: bool = False,
     workers: int = 1,
+    on_error: str = "raise",
+    kept_out: Optional[List[int]] = None,
 ) -> TrajectoryStore:
     """
     Apply transform to source and cache result under cache_root/<cache_key>/.
@@ -79,6 +95,15 @@ def apply_disk_cached(
     `workers + 1` whole episodes of RAM at *source* resolution, so raise it with
     an eye on memory rather than on core count. Requires an indexed source
     (`n_episodes` + `get_episode`); anything else falls back to serial.
+
+    on_error="skip" logs and skips an episode the source cannot produce, instead
+    of aborting. Real datasets are ragged -- ABC-130k has episodes missing a
+    camera stream entirely -- and one of those should not destroy a thousand
+    episodes of completed work. It is off by default because a cache silently
+    missing episodes is its own hazard: pass `kept_out` to receive the source
+    indices actually written, in order, which is what any positional mapping
+    (an episode hold-out, say) must be built from rather than from
+    `range(n_episodes)`.
     """
     cache_key = transform.cache_key()
     cache_path = os.path.join(cache_root, cache_key)
@@ -93,19 +118,33 @@ def apply_disk_cached(
 
     log.info(f"[disk_cache] MISS {cache_key}  → building {cache_path}")
 
+    if on_error not in ("raise", "skip"):
+        raise ValueError(f"on_error must be 'raise' or 'skip', got {on_error!r}")
+
     indexed = hasattr(source, "get_episode") and hasattr(source, "n_episodes")
     if workers > 1 and indexed:
         log.info("[disk_cache] reading %d episodes ahead in %d threads",
                  workers + 1, workers)
-        episodes = _episode_pipeline(source, transform, source.n_episodes, workers)
+        episodes = _episode_pipeline(source, transform, source.n_episodes,
+                                     workers, on_error=on_error)
     else:
         if workers > 1:
             log.warning("[disk_cache] workers=%d ignored: source is not indexed",
                         workers)
-        episodes = (transform.apply_episode(ep) for ep in source.iter_episodes())
+        episodes = (
+            (i, transform.apply_episode(ep))
+            for i, ep in enumerate(source.iter_episodes())
+        )
 
     writer = None
-    for transformed in episodes:
+    skipped = 0
+    for index, transformed in episodes:
+        if isinstance(transformed, _EpisodeFailed):
+            skipped += 1
+            log.warning("[disk_cache] skipping episode %d: %s: %s",
+                        transformed.index, type(transformed.error).__name__,
+                        str(transformed.error)[:200])
+            continue
         if writer is None:
             writer = writer_cls.create(
                 path=cache_path,
@@ -114,7 +153,12 @@ def apply_disk_cached(
                 image_keys=list(image_keys),
             )
         writer.put_episode(transformed)
+        if kept_out is not None:
+            kept_out.append(index)
 
+    if skipped:
+        log.warning("[disk_cache] %d episode(s) skipped; the cache has fewer "
+                    "episodes than the source", skipped)
     if writer is None:
         raise ValueError("Source store is empty — nothing to cache.")
     writer.finalize()

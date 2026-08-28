@@ -46,6 +46,27 @@ def _zarr_append(arr: zarr.Array, data: np.ndarray) -> None:
     arr[old : old + T] = data
 
 
+def _register_image_codecs() -> None:
+    """Register imagecodecs' numcodecs codecs, for reading as well as writing.
+
+    imagecodecs does not register on import, and zarr resolves an array's
+    compressor through the numcodecs registry when *opening* it. Registering only
+    inside `_jpeg_compressor` (the write path) would therefore leave a
+    JPEG-compressed store unreadable in any process that never wrote one --
+    including every training process. Idempotent, so calling it at import is safe.
+    """
+    try:
+        import imagecodecs.numcodecs as imagecodecs_numcodecs
+        imagecodecs_numcodecs.register_codecs(verbose=False)
+    except ImportError:
+        pass  # no imagecodecs: only lossless stores are readable, which is fine
+    except Exception as e:  # pragma: no cover - registration must never be fatal
+        log.warning("could not register imagecodecs codecs: %s", e)
+
+
+_register_image_codecs()
+
+
 def _jpeg_compressor() -> numcodecs.abc.Codec:
     """Return best available JPEG compressor, falling back to lz4.
 
@@ -60,10 +81,7 @@ def _jpeg_compressor() -> numcodecs.abc.Codec:
     except ImportError:
         pass
     try:
-        # imagecodecs does not register its codecs on import, so asking the
-        # numcodecs registry first would always miss. Registering is idempotent.
-        import imagecodecs.numcodecs as imagecodecs_numcodecs
-        imagecodecs_numcodecs.register_codecs(verbose=False)
+        _register_image_codecs()  # no-op if already done at import
         # The quality kwarg was renamed `quality` -> `level`; try both so this
         # works either side of that change instead of silently falling back.
         for kwarg in ("level", "quality"):

@@ -466,11 +466,20 @@ class ABCMcapStore(EpisodeStore):
             path = os.path.join(root, idx["camera_files"][cam])
             if backend == "modern":
                 from .video import _ModernDecoder as D
-            elif backend == "legacy":
-                from .video import _LegacyDecoder as D
+                # Exact seeking, not the default approximate. The sidecar is
+                # remuxed from raw Annex-B h264, which carries no timestamps, so
+                # ffmpeg synthesises them and index->timestamp estimation from
+                # the average frame rate breaks down at the tail: episode 8 of
+                # the bottles task reports 4370 frames and ffmpeg decodes all
+                # 4370, yet approximate mode raises on frame 4368. Exact builds
+                # a real index and measured just as cheap to open here.
+                dec = D(path, seek_mode="exact")
             else:
-                from .video import _PyAVDecoder as D
-            dec = D(path)
+                if backend == "legacy":
+                    from .video import _LegacyDecoder as D
+                else:
+                    from .video import _PyAVDecoder as D
+                dec = D(path)
             self._decoder_cache.put(cache_key, dec)
         mapping = self._frameidx(ep_idx, cam, root)
         native = [int(mapping[i]) for i in frame_indices]

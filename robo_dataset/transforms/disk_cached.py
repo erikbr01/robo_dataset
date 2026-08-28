@@ -10,6 +10,7 @@ helpers or library versions.  Use the `version` field on your transform class to
 bust the cache when dependencies change.
 """
 
+import collections
 import logging
 import os
 import shutil
@@ -24,6 +25,39 @@ from .base import DiskCachedTransform
 log = logging.getLogger(__name__)
 
 
+def _episode_pipeline(source, transform, n_episodes: int, workers: int):
+    """Yield transformed episodes in order, reading/transforming ahead in threads.
+
+    The write side cannot be parallelised: `ZarrStoreWriter.put_episode` appends,
+    so out-of-order writes would scramble `episode_ends`. (That is why
+    `convert()`'s thread pool only engages for an indexed `WritableEpisodeStore`.)
+    The read side is where the time goes, though -- decoding video and resizing --
+    and both release the GIL, so threads are enough and avoid shipping
+    multi-gigabyte episodes through pickle.
+
+    In-flight work is bounded to `workers + 1` episodes rather than submitting
+    everything: a source episode at native resolution can be many GB, so an
+    unbounded pool would queue the entire dataset into RAM.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(i):
+        return transform.apply_episode(source.get_episode(i))
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = collections.deque()
+        nxt = 0
+        while nxt < min(workers + 1, n_episodes):
+            pending.append(pool.submit(one, nxt))
+            nxt += 1
+        while pending:
+            result = pending.popleft().result()
+            if nxt < n_episodes:
+                pending.append(pool.submit(one, nxt))
+                nxt += 1
+            yield result
+
+
 def apply_disk_cached(
     source: TrajectoryStore,
     transform: DiskCachedTransform,
@@ -31,12 +65,20 @@ def apply_disk_cached(
     image_keys: List[str] = (),
     writer_cls: Type[WritableTrajectoryStore] = ZarrStoreWriter,
     force: bool = False,
+    workers: int = 1,
 ) -> TrajectoryStore:
     """
     Apply transform to source and cache result under cache_root/<cache_key>/.
 
     Uses writer_cls to write the cache and writer_cls.open_readonly() to re-open it.
     The writer is created lazily from the first transformed episode — no double iteration.
+
+    workers > 1 reads and transforms up to `workers + 1` episodes concurrently
+    while writing them in order. Worth it when the source decodes video (an ABC
+    MCAP store spends most of the pass in decode), but it costs roughly
+    `workers + 1` whole episodes of RAM at *source* resolution, so raise it with
+    an eye on memory rather than on core count. Requires an indexed source
+    (`n_episodes` + `get_episode`); anything else falls back to serial.
     """
     cache_key = transform.cache_key()
     cache_path = os.path.join(cache_root, cache_key)
@@ -51,9 +93,19 @@ def apply_disk_cached(
 
     log.info(f"[disk_cache] MISS {cache_key}  → building {cache_path}")
 
+    indexed = hasattr(source, "get_episode") and hasattr(source, "n_episodes")
+    if workers > 1 and indexed:
+        log.info("[disk_cache] reading %d episodes ahead in %d threads",
+                 workers + 1, workers)
+        episodes = _episode_pipeline(source, transform, source.n_episodes, workers)
+    else:
+        if workers > 1:
+            log.warning("[disk_cache] workers=%d ignored: source is not indexed",
+                        workers)
+        episodes = (transform.apply_episode(ep) for ep in source.iter_episodes())
+
     writer = None
-    for ep_data in source.iter_episodes():
-        transformed = transform.apply_episode(ep_data)
+    for transformed in episodes:
         if writer is None:
             writer = writer_cls.create(
                 path=cache_path,

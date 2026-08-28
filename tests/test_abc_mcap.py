@@ -162,3 +162,63 @@ def test_jpeg_compressor_round_trips_images():
     mse = np.mean((frame.astype(np.float64) - back.astype(np.float64)) ** 2)
     psnr = float("inf") if mse == 0 else 20 * np.log10(255.0 / np.sqrt(mse))
     assert psnr >= 30.0
+
+
+# ── parallel disk cache ───────────────────────────────────────────────────────
+
+class _FakeIndexedStore:
+    """Minimal indexed EpisodeStore: enough for apply_disk_cached's fast path."""
+
+    def __init__(self, n=7):
+        self._eps = [
+            {"img": (np.arange(4 * 6 * 8 * 3).reshape(4, 6, 8, 3) % 251 + i).astype(np.uint8),
+             "state": np.full((4, 2), float(i), dtype=np.float32)}
+            for i in range(n)
+        ]
+
+    @property
+    def n_episodes(self):
+        return len(self._eps)
+
+    def get_episode(self, i):
+        return {k: v.copy() for k, v in self._eps[i].items()}
+
+    def iter_episodes(self):
+        for i in range(self.n_episodes):
+            yield self.get_episode(i)
+
+
+def test_parallel_disk_cache_matches_serial(tmp_path):
+    """workers>1 must not reorder episodes -- the writer appends, so order is data."""
+    from robo_dataset.transforms import apply_disk_cached
+
+    tr = ResizeImages(["img"], target_h=4, target_w=4, letterbox=True)
+    a = apply_disk_cached(_FakeIndexedStore(), tr, str(tmp_path / "serial"),
+                          image_keys=["img"], workers=1)
+    b = apply_disk_cached(_FakeIndexedStore(), tr, str(tmp_path / "par"),
+                          image_keys=["img"], workers=4)
+
+    assert list(a.episode_ends) == list(b.episode_ends)
+    # state is lossless on both sides, so episode identity is checkable exactly:
+    # a scrambled order would still match on shape but not on values.
+    np.testing.assert_array_equal(
+        a.get_sequence("state", 0, a.n_frames),
+        b.get_sequence("state", 0, b.n_frames),
+    )
+
+
+def test_parallel_disk_cache_falls_back_when_not_indexed(caplog):
+    """A source without get_episode must still work, with a warning."""
+    from robo_dataset.transforms import apply_disk_cached
+    import tempfile
+
+    class OnlyIterable:
+        def iter_episodes(self):
+            yield {"state": np.zeros((3, 2), dtype=np.float32)}
+
+    with tempfile.TemporaryDirectory() as td:
+        with caplog.at_level("WARNING"):
+            out = apply_disk_cached(OnlyIterable(), ResizeImages([], 4, 4),
+                                    td, workers=8)
+    assert out.n_frames == 3
+    assert any("not indexed" in r.getMessage() for r in caplog.records)

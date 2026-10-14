@@ -84,13 +84,31 @@ class TestEpisodeStoreEquivalence:
                 np.testing.assert_array_equal(result[key], ep[key])
 
     def test_get_sequence_matches_flat_store(self, zarr_store_path, episode_store):
-        """get_sequence with flat indices must return identical data to ZarrStore."""
+        """get_sequence with flat indices must return the same data as ZarrStore.
+
+        Image keys are compared by PSNR rather than exactly, because the two
+        stores do not compress them the same way: `ZarrStoreWriter` runs image
+        keys through `_jpeg_compressor()` (lossy where a JPEG codec is
+        installed), while `ZarrEpisodeStore` always uses lossless lz4 and takes
+        no `image_keys` at all. This assertion used to be exact and passed only
+        because the JPEG codec never actually loaded -- both sides silently fell
+        back to lz4 -- so it was testing the fallback, not the equivalence.
+        Everything else stays bit-exact.
+        """
         from robo_dataset.backends.zarr_backend import ZarrStore
         flat = ZarrStore(zarr_store_path)
         for key in flat.keys:
             expected = flat.get_sequence(key, 0, flat.n_frames)
             actual = episode_store.get_sequence(key, 0, episode_store.n_frames)
-            np.testing.assert_array_equal(actual, expected, err_msg=f"mismatch for {key!r}")
+            assert actual.shape == expected.shape, f"shape mismatch for {key!r}"
+            if key in OBS_KEYS:
+                mse = np.mean((actual.astype(np.float64)
+                               - expected.astype(np.float64)) ** 2)
+                psnr = float("inf") if mse == 0 else 20 * np.log10(255.0 / np.sqrt(mse))
+                assert psnr >= 30.0, f"PSNR {psnr:.1f} dB too low for {key!r}"
+            else:
+                np.testing.assert_array_equal(
+                    actual, expected, err_msg=f"mismatch for {key!r}")
 
 
 # ── Parallel write independence ────────────────────────────────────────────────
@@ -186,10 +204,18 @@ class TestDataLoaderEquivalence:
 
         for flat_batch, ep_batch in zip(flat_batches, ep_batches):
             for key in flat_batch:
-                np.testing.assert_array_equal(
-                    flat_batch[key].numpy(), ep_batch[key].numpy(),
-                    err_msg=f"batch mismatch for key {key!r}",
-                )
+                a, b = flat_batch[key].numpy(), ep_batch[key].numpy()
+                assert a.shape == b.shape, f"shape mismatch for key {key!r}"
+                if key in OBS_KEYS:
+                    # Lossy vs lossless image compression between the two
+                    # stores; see test_get_sequence_matches_flat_store.
+                    mse = np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)
+                    psnr = float("inf") if mse == 0 else 20 * np.log10(255.0 / np.sqrt(mse))
+                    assert psnr >= 30.0, f"PSNR {psnr:.1f} dB too low for {key!r}"
+                else:
+                    np.testing.assert_array_equal(
+                        a, b, err_msg=f"batch mismatch for key {key!r}",
+                    )
 
     def test_multiworker_dataloader(self, episode_store):
         """ZarrEpisodeStore must work correctly with multiple DataLoader workers."""

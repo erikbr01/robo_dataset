@@ -82,11 +82,21 @@ def _pick_decoder_backend() -> str:
 
 
 class _ModernDecoder:
-    """torchcodec >= 0.1: VideoDecoder with arbitrary-index batch API."""
+    """torchcodec >= 0.1: VideoDecoder with arbitrary-index batch API.
 
-    def __init__(self, path: str):
+    `seek_mode` defaults to "approximate", which maps frame index to timestamp
+    from the stream's average frame rate -- no scan on open, correct as long as
+    the container's timing metadata is trustworthy. It is not always: a file
+    remuxed from raw Annex-B h264 has no original timestamps, so ffmpeg
+    synthesises them, and the estimate can run off the end of the stream near the
+    tail (a frame well inside `len(decoder)` then raises "no more frames left to
+    decode"). Pass seek_mode="exact" for those; it builds a real index, which for
+    these files measured as cheap as the approximate open.
+    """
+
+    def __init__(self, path: str, seek_mode: str = "approximate"):
         from torchcodec.decoders import VideoDecoder
-        self._dec = VideoDecoder(path, device="cpu", seek_mode="approximate")
+        self._dec = VideoDecoder(path, device="cpu", seek_mode=seek_mode)
 
     def get_frames(self, indices: List[int]) -> np.ndarray:
         result = self._dec.get_frames_at(indices=indices)

@@ -46,6 +46,27 @@ def _zarr_append(arr: zarr.Array, data: np.ndarray) -> None:
     arr[old : old + T] = data
 
 
+def _register_image_codecs() -> None:
+    """Register imagecodecs' numcodecs codecs, for reading as well as writing.
+
+    imagecodecs does not register on import, and zarr resolves an array's
+    compressor through the numcodecs registry when *opening* it. Registering only
+    inside `_jpeg_compressor` (the write path) would therefore leave a
+    JPEG-compressed store unreadable in any process that never wrote one --
+    including every training process. Idempotent, so calling it at import is safe.
+    """
+    try:
+        import imagecodecs.numcodecs as imagecodecs_numcodecs
+        imagecodecs_numcodecs.register_codecs(verbose=False)
+    except ImportError:
+        pass  # no imagecodecs: only lossless stores are readable, which is fine
+    except Exception as e:  # pragma: no cover - registration must never be fatal
+        log.warning("could not register imagecodecs codecs: %s", e)
+
+
+_register_image_codecs()
+
+
 def _jpeg_compressor() -> numcodecs.abc.Codec:
     """Return best available JPEG compressor, falling back to lz4.
 
@@ -60,16 +81,22 @@ def _jpeg_compressor() -> numcodecs.abc.Codec:
     except ImportError:
         pass
     try:
-        # numcodecs signals an unregistered codec with ValueError, not ImportError.
-        codec = numcodecs.registry.get_codec(
-            {"id": "imagecodecs_jpeg", "quality": _JPEG_QUALITY}
-        )
-        log.warning(
-            "Jpeg2k codec unavailable; using imagecodecs JPEG (lossy, quality=%d) "
-            "for image keys.", _JPEG_QUALITY,
-        )
-        return codec
-    except (ImportError, ValueError):
+        _register_image_codecs()  # no-op if already done at import
+        # The quality kwarg was renamed `quality` -> `level`; try both so this
+        # works either side of that change instead of silently falling back.
+        for kwarg in ("level", "quality"):
+            try:
+                codec = numcodecs.registry.get_codec(
+                    {"id": "imagecodecs_jpeg", kwarg: _JPEG_QUALITY}
+                )
+            except (ValueError, TypeError):
+                continue
+            log.warning(
+                "Jpeg2k codec unavailable; using imagecodecs JPEG (lossy, "
+                "%s=%d) for image keys.", kwarg, _JPEG_QUALITY,
+            )
+            return codec
+    except (ImportError, ValueError, TypeError):
         pass
     log.warning(
         "No JPEG codec available (Jpeg2k / imagecodecs_jpeg); falling back to "

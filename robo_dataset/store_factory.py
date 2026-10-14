@@ -13,6 +13,15 @@ def detect_format(path: str) -> str:
     if os.path.isdir(path):
         if os.path.exists(os.path.join(path, "meta", "info.json")):
             return "lerobot"
+        # ABC-130k: a directory of episode dirs, each holding episode.mcap.
+        # Checked before the meta.json probes because ABC ships no store-level
+        # metadata at all -- the layout itself is the only signal.
+        for name in sorted(os.listdir(path))[:64]:
+            child = os.path.join(path, name)
+            if os.path.isdir(child) and os.path.exists(
+                os.path.join(child, "episode.mcap")
+            ):
+                return "abc_mcap"
         if os.path.exists(os.path.join(path, "frames.tfrecord")):
             return "rlds"
         if os.path.exists(os.path.join(path, "meta.json")):
@@ -40,7 +49,7 @@ def open_store(path: str, format: str = "auto", obs_keys: Optional[list] = None,
     Args:
         path:     store root (dir) or HDF5 file.
         format:   'auto' | 'video' | 'zarr' | 'zarr_sharded' | 'rlds'
-                  | 'lerobot' | 'robomimic_hdf5' | 'droid'
+                  | 'lerobot' | 'robomimic_hdf5' | 'droid' | 'abc_mcap'
         obs_keys: required for robomimic_hdf5 (which obs keys to expose).
         kwargs:   forwarded to the backend constructor.
     """
@@ -50,6 +59,9 @@ def open_store(path: str, format: str = "auto", obs_keys: Optional[list] = None,
     if format == "rlds":
         from .backends.rlds import RLDSFrameStore
         return RLDSFrameStore(path, **kwargs)
+    if format == "abc_mcap":
+        from .backends.abc_mcap import ABCMcapStore
+        return ABCMcapStore(path, **kwargs)
     if format == "video":
         from .backends.video import VideoStore
         return VideoStore(path, **kwargs)
